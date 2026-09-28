@@ -8,7 +8,9 @@ SRC_URI:append:common-torizon = " \
 # kernel recipes have to merge it with the generated .config themselves, or the
 # fragments won't apply, and the MediaTek Genio bbappend reads the requests back
 # from it after configure to check they reached the built .config.
-SRC_URI:append = "${@bb.utils.contains_any('MACHINE', 'sl1680 imx95-19x19-verdin imx93frdm lec-mtk-i1200-ufs', 'file://torizon.cfg', '', d)}"
+SRC_URI:append = " \
+    ${@bb.utils.contains_any('MACHINE', 'sl1680 imx95-19x19-verdin imx93frdm lec-mtk-i1200-ufs imx6sxsabresd', 'file://torizon.cfg', '', d)} \
+"
 
 SRC_URI:append:cfs-support = "\
     file://composefs.scc \
