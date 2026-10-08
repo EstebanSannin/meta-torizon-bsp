@@ -27,7 +27,8 @@ tdx_conf_from_template local.conf
 
 # meta-qcom requires meta-lts-mixins (lts-linux-firmware-mixin) for the
 # Qualcomm firmware packages. Board-specific BSP layers (e.g.
-# meta-qcom-arduino) depend on meta-qcom.
+# meta-qcom-arduino) depend on meta-qcom. meta-arduino-applab adds Arduino
+# App Lab support (machine feature arduino-applab).
 tdx_append_once conf/bblayers.conf "# Torizon" <<EOF2
 # Torizon
 # LAYER_CONF_VERSION is increased each time build/conf/bblayers.conf
@@ -59,6 +60,7 @@ BSPLAYERS ?= " \\
   \${OEROOT}/layers/meta-lts-mixins \\
   \${OEROOT}/layers/meta-qcom \\
   \${OEROOT}/layers/meta-qcom-arduino \\
+  \${OEROOT}/layers/meta-arduino-applab \\
 "
 
 # Add your overlay location to EXTRALAYERS
