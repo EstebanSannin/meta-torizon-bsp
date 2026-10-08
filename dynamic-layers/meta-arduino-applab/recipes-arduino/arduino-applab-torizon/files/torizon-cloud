@@ -1,0 +1,42 @@
+#!/bin/sh
+# Torizon Cloud for Arduino App Lab, run as root through sudo.
+#   status     device UUID, as JSON
+#   provision  provision this board; stdin: token, then device name
+
+PROVISION_SCRIPT_URL="https://app.torizon.io/statics/scripts/provision-device.sh"
+
+status() {
+    uuid=$(aktualizr-info 2>/dev/null | sed -n 's/.*Device ID: //p')
+    if [ -n "$uuid" ]; then
+        printf '{"provisioned": true, "deviceUuid": "%s"}\n' "$uuid"
+    else
+        printf '{"provisioned": false}\n'
+    fi
+}
+
+provision() {
+    IFS= read -r token
+    IFS= read -r name
+    if [ -z "$token" ]; then
+        echo "no provisioning token" >&2
+        exit 1
+    fi
+    script=$(mktemp)
+    trap 'rm -f "$script"' EXIT
+    if ! curl -fsSL -o "$script" "$PROVISION_SCRIPT_URL"; then
+        echo "cannot download the provisioning script" >&2
+        exit 1
+    fi
+    # The script is verbose (and prints the token): keep only the outcome
+    if ! out=$(bash "$script" -t "$token" ${name:+-n "$name"} 2>&1); then
+        printf '%s\n' "$out" | grep -v -i -E 'authorization|bearer|token' | tail -n 5 >&2
+        exit 1
+    fi
+    status
+}
+
+case "$1" in
+    status) status ;;
+    provision) provision ;;
+    *) echo "usage: $0 status | provision" >&2; exit 2 ;;
+esac

@@ -5,7 +5,11 @@ to UID 1001 (see the static ID tables in ventuno-q.inc)."
 LICENSE = "MIT"
 LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda2f7b4f302"
 
-SRC_URI = "file://arduino-applab-torizon.tmpfiles"
+SRC_URI = " \
+    file://arduino-applab-torizon.tmpfiles \
+    file://torizon-cloud \
+    file://90-arduino-applab-torizon-cloud \
+"
 
 S = "${UNPACKDIR}"
 
@@ -22,9 +26,12 @@ USERADD_PARAM:${PN} = "-u 1000 -g arduino \
 
 do_install() {
     install -D -m 0644 ${S}/arduino-applab-torizon.tmpfiles ${D}${nonarch_libdir}/tmpfiles.d/arduino-applab-torizon.conf
+    # Torizon Cloud from App Lab (status, provisioning)
+    install -D -m 0755 ${S}/torizon-cloud ${D}${libexecdir}/arduino-applab/torizon-cloud
+    install -D -m 0440 ${S}/90-arduino-applab-torizon-cloud ${D}${sysconfdir}/sudoers.d/90-arduino-applab-torizon-cloud
 }
 
-FILES:${PN} += "${nonarch_libdir}/tmpfiles.d"
+FILES:${PN} += "${nonarch_libdir}/tmpfiles.d ${libexecdir}/arduino-applab"
 
 pkg_postinst_ontarget:${PN} () {
     if [ ! -e /etc/.arduino_passwd_expired ]; then
@@ -33,4 +40,4 @@ pkg_postinst_ontarget:${PN} () {
     fi
 }
 
-RDEPENDS:${PN} += "torizon-users ${VIRTUAL-RUNTIME_container_engine}"
+RDEPENDS:${PN} += "torizon-users ${VIRTUAL-RUNTIME_container_engine} bash curl jq unzip"
