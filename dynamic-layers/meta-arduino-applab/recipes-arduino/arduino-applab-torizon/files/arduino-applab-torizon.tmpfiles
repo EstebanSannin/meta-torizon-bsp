@@ -1,0 +1,3 @@
+# Home of the "arduino" login. Real path: arduino-cli does not compile sketch
+# libraries when $HOME is reached through a symlink (/home -> /var/rootdirs/home).
+d /var/rootdirs/home/arduino 0750 arduino arduino -
