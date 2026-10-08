@@ -1,0 +1,3 @@
+arduino:x:1000:1000::/var/rootdirs/home/arduino:/bin/bash
+torizon:x:1001:1001::/home/torizon:/bin/sh
+adb:x:109:109::/:/bin/false
