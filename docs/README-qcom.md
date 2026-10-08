@@ -90,6 +90,8 @@ Known limitations
  * On the VENTUNO Q the HDMI EDID is currently not read (`/sys/class/drm/card0-HDMI-A-1/edid`
    is empty), so the display falls back to 1024x768.
  * The boot firmware (XBL, UEFI) is not updated through Torizon OTA.
+ * On the VENTUNO Q the USB controller of the MCU link (`usb_2`) stops detecting devices
+   once the USB gadget is bound at boot; `ventuno-q-usb2-reset.service` restarts it once.
  * After a warm reboot the Ethernet interface occasionally receives no packets (no DHCP
    lease) although the link is up; `ip link set eth0 down && ip link set eth0 up`
    recovers it.
