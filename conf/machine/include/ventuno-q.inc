@@ -4,6 +4,9 @@
 
 require common-qcom.inc
 
+# usb_2 (link to the MCU) cannot detect devices after boot until restarted
+MACHINE_EXTRA_RRECOMMENDS:append = " ventuno-q-usb2-reset"
+
 # Arduino App Lab support, from meta-arduino-applab
 MACHINE_FEATURES:append = " arduino-applab"
 

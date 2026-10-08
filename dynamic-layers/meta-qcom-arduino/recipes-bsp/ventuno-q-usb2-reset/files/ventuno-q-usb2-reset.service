@@ -1,0 +1,13 @@
+[Unit]
+Description=VENTUNO Q: restart the MCU USB controller once at boot
+# Restarting it earlier in boot is not enough (2 of 5 boots): run once the
+# USB gadget and the Arduino router are up.
+After=android-tools-adbd.service arduino-router.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/ventuno-q-usb2-reset
+
+[Install]
+WantedBy=multi-user.target
