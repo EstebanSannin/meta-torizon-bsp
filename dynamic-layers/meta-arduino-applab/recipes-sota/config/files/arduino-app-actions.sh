@@ -14,13 +14,15 @@ log() {
 
 # Report a status to aktualizr (stdout, parsed when the exit code is 0)
 reply() {
-    msg=$(printf '%s' "$2" | tr -d '"' | tr -d '\\' | tr '\n' ' ')
+    msg=$(printf '%s' "$2" | tr -d '"\134' | tr '\n' ' ')
     log "$1: $msg"
     printf '{"status": "%s", "message": "%s"}\n' "$1" "$msg"
 }
 
-# Run arduino-app-cli as the App Lab user, the owner of its data
+# Run arduino-app-cli as the App Lab user, the owner of its data (from /:
+# aktualizr's working directory is not readable by that user)
 app_cli() {
+    cd / || return 1
     su -s /bin/sh "$ARDUINO_USER" -c 'TMPDIR=/tmp arduino-app-cli "$@"' -- arduino-app-cli "$@"
 }
 
@@ -44,16 +46,20 @@ do_install() {
         return
     fi
 
-    # arduino-app-cli runs as the App Lab user: hand it a readable copy
-    mkdir -p "$WORK_DIR"
-    cp "$pkg" "$WORK_DIR/$name.ard"
-    chown -R "$ARDUINO_USER" "$WORK_DIR"
-    if ! out=$(app_cli app install "$WORK_DIR/$name.ard" 2>&1); then
+    # Already installed (e.g. deployed again): just start it
+    if ! app_cli app list --all 2>/dev/null | grep -q "^release:$name "; then
+        # arduino-app-cli runs as the App Lab user: hand it a readable copy
+        mkdir -p "$WORK_DIR"
+        cp "$pkg" "$WORK_DIR/$name.ard"
+        chown -R "$ARDUINO_USER" "$WORK_DIR"
+        if ! out=$(app_cli app install "$WORK_DIR/$name.ard" 2>&1); then
+            rm -f "$WORK_DIR/$name.ard"
+            app_cli app destroy "release:$name" >/dev/null 2>&1
+            reply failed "install of $name failed: $(printf '%s' "$out" | tail -n 3)"
+            return
+        fi
         rm -f "$WORK_DIR/$name.ard"
-        reply failed "install of $name failed: $(printf '%s' "$out" | tail -n 3)"
-        return
     fi
-    rm -f "$WORK_DIR/$name.ard"
 
     # One app runs at a time: stop whatever runs, start the new release
     app_cli app ps 2>/dev/null | awk 'NR > 1 && $2 == "running" { print $1 }' |
