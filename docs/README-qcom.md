@@ -88,7 +88,8 @@ Boot
 Known limitations
 ======
  * On the VENTUNO Q the HDMI EDID is currently not read (`/sys/class/drm/card0-HDMI-A-1/edid`
-   is empty), so the display falls back to 1024x768.
+   is empty). The image defaults to 1920x1080 at 60 Hz (`drm.edid_firmware`); other modes
+   need another EDID file.
  * The boot firmware (XBL, UEFI) is not updated through Torizon OTA.
  * On the VENTUNO Q the USB controller of the MCU link (`usb_2`) stops detecting devices
    once the USB gadget is bound at boot; `ventuno-q-usb2-reset.service` restarts it once.
