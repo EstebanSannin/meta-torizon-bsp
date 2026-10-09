@@ -21,6 +21,10 @@ provision() {
         echo "no provisioning token" >&2
         exit 1
     fi
+    if aktualizr-info 2>/dev/null | grep -q "Device ID: "; then
+        echo "this board is already provisioned" >&2
+        exit 1
+    fi
     script=$(mktemp)
     trap 'rm -f "$script"' EXIT
     if ! curl -fsSL -o "$script" "$PROVISION_SCRIPT_URL"; then
