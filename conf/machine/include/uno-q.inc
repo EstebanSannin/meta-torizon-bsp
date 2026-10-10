@@ -10,3 +10,12 @@ require common-qcom.inc
 
 # TEMPORARY, to review: fastrpc config for the UNO Q, no failing audiopd
 MACHINE_EXTRA_RRECOMMENDS:append = " uno-q-dsp"
+
+# Arduino App Lab support, from meta-arduino-applab
+MACHINE_FEATURES:append = " arduino-applab"
+
+# App Lab logs in as 'arduino' with UID 1000: give it UID/GID 1000 and move
+# 'torizon' to 1001 (same groups and sudo; Torizon relies on the name). Later
+# tables override earlier ones (useradd-staticids).
+USERADD_UID_TABLES:append = "${@bb.utils.contains('MACHINE_FEATURES', 'arduino-applab', ' files/arduino-applab-static-passwd', '', d)}"
+USERADD_GID_TABLES:append = "${@bb.utils.contains('MACHINE_FEATURES', 'arduino-applab', ' files/arduino-applab-static-group', '', d)}"
