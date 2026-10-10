@@ -1,0 +1,79 @@
+From: Stefano Viola <stefano.viola@toradex.com>
+Subject: [PATCH] misc: fastrpc: give back a closed user's contexts and mappings
+
+Invoke contexts hold a reference to their fastrpc_user. Contexts left on
+fl->pending or fl->interrupted when a process is killed in the middle of
+an invoke are only dropped by fastrpc_user_free(), which cannot run while
+they hold that reference. The user, its maps and their IOVA space then
+leak until reboot, and the next process runs out of address space on the
+same context banks (seen with Qualcomm Genie: the second LLM load fails
+with "failed to map buffer").
+
+Give back the contexts, the maps and the mmap buffers when the file is
+released, after the DSP process is released.
+
+Upstream-Status: Pending
+Signed-off-by: Stefano Viola <stefano.viola@toradex.com>
+---
+--- a/drivers/misc/fastrpc.c
++++ b/drivers/misc/fastrpc.c
+@@ -1762,6 +1762,51 @@
+ 				       sc, &args[0]);
+ }
+ 
++/*
++ * Contexts left by an interrupted invoke hold a reference to the user, so the
++ * user can outlive its file and keep its mappings forever. Once the DSP
++ * process is released, give back the contexts, mappings and buffers.
++ */
++static void fastrpc_user_release_resources(struct fastrpc_user *fl)
++{
++	struct fastrpc_invoke_ctx *ctx, *n;
++	struct fastrpc_map *map;
++	struct fastrpc_buf *buf;
++	LIST_HEAD(ctxs);
++
++	spin_lock(&fl->lock);
++	list_splice_init(&fl->interrupted, &ctxs);
++	list_splice_init(&fl->pending, &ctxs);
++	spin_unlock(&fl->lock);
++
++	list_for_each_entry_safe(ctx, n, &ctxs, node) {
++		list_del_init(&ctx->node);
++		fastrpc_context_put(ctx);
++	}
++
++	for (;;) {
++		spin_lock(&fl->lock);
++		map = list_first_entry_or_null(&fl->maps, struct fastrpc_map, node);
++		if (map)
++			list_del_init(&map->node);
++		spin_unlock(&fl->lock);
++		if (!map)
++			break;
++		fastrpc_map_put(map);
++	}
++
++	for (;;) {
++		spin_lock(&fl->lock);
++		buf = list_first_entry_or_null(&fl->mmaps, struct fastrpc_buf, node);
++		if (buf)
++			list_del(&buf->node);
++		spin_unlock(&fl->lock);
++		if (!buf)
++			break;
++		fastrpc_buf_free(buf);
++	}
++}
++
+ static int fastrpc_device_release(struct inode *inode, struct file *file)
+ {
+ 	struct fastrpc_user *fl = (struct fastrpc_user *)file->private_data;
+@@ -1769,6 +1814,7 @@
+ 	unsigned long flags;
+ 
+ 	fastrpc_release_current_dsp_process(fl);
++	fastrpc_user_release_resources(fl);
+ 
+ 	spin_lock_irqsave(&cctx->lock, flags);
+ 	list_del(&fl->user);
