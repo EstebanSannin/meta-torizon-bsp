@@ -7,3 +7,6 @@
 # integration is the same as on the other qcom machines (sota_qcom).
 
 require common-qcom.inc
+
+# TEMPORARY, to review: fastrpc config for the UNO Q, no failing audiopd
+MACHINE_EXTRA_RRECOMMENDS:append = " uno-q-dsp"

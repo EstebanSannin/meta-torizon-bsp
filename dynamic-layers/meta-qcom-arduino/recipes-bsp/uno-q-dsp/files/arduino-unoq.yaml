@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: MIT
+# yaml-language-server: $schema=schema.json
+# The UNO Q uses the RB1 DSP binaries (same QCM2290 SoC), but the RB1 entry
+# only matches the RB1 board model.
+machines:
+  Arduino UnoQ:
+    DSP_LIBRARY_PATH: qcm2290/Thundercomm/RB1/dsp
