@@ -9,6 +9,7 @@ DEPENDS:append = " jq-native"
 
 ARDUINO_APP_TARGET ?= ""
 ARDUINO_APP_TARGET:ventuno-q ?= "ventunoq"
+ARDUINO_APP_TARGET:uno-q ?= "unoq"
 ARDUINO_USER ?= "arduino"
 
 do_install:append () {
