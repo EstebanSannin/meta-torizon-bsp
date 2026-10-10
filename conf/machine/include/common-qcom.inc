@@ -1,13 +1,14 @@
 # Shared Torizon <-> Qualcomm BSP integration glue for machines based on
 # meta-qcom (Qualcomm Dragonwing / Linux reference BSP).
 #
-# Boot flow on these machines: XBL -> UEFI (EDK2) -> systemd-boot -> UKI.
-# There is no U-Boot. The OSTree side of it is provided by meta-updater's
-# sota_qcom class, selected automatically by sota.bbclass for the "qcom"
-# machine override: systemd-boot as OSTREE_BOOTLOADER, a UKI with an empty
-# embedded command line, BLS entries written by OSTree with boot counting,
-# and the "qcomflash" image that is flashed over EDL with qdl. Only the
-# Torizon-specific glue lives here.
+# Boot flow on these machines: XBL -> UEFI -> systemd-boot -> UKI. UEFI is
+# Qualcomm's EDK2, or U-Boot loaded by the Android bootloader (UNO Q); no
+# U-Boot environment or boot script is used. The OSTree side of it is
+# provided by meta-updater's sota_qcom class, selected automatically by
+# sota.bbclass for the "qcom" machine override: systemd-boot as
+# OSTREE_BOOTLOADER, a UKI with an empty embedded command line, BLS entries
+# written by OSTree with boot counting, and the "qcomflash" image that is
+# flashed over EDL with qdl. Only the Torizon-specific glue lives here.
 
 # --- Kernel command line ----------------------------------------------------
 # With systemd-boot the BLS entries written by OSTree are the only source of
@@ -21,12 +22,13 @@
 OSTREE_KERNEL_ARGS:prepend = "console=${KERNEL_CONSOLE} ${OSTREE_KERNEL_ARGS_COMMON} ${KERNEL_CMDLINE_EXTRA} "
 
 # --- OTA / bootloader environment -------------------------------------------
-# No U-Boot environment exists on these machines: rollback relies on
+# No U-Boot environment is used on these machines: rollback relies on
 # systemd-boot boot counting instead.
 SOTA_CLIENT_FEATURES:remove = "ubootenv"
 
 # --- Bootloader updates -----------------------------------------------------
 # The Torizon bootloader secondary (bl_actions.sh) updates U-Boot in the eMMC
-# boot partitions. On these machines the boot chain (XBL, UEFI) is Qualcomm
-# firmware and is not updated through Torizon OTA yet, so do not install it.
+# boot partitions. On these machines the boot chain (XBL, UEFI, or the U-Boot
+# loaded by the Android bootloader) is not updated through Torizon OTA yet, so
+# do not install it.
 BL_UPDATE_SUPPORT:pn-aktualizr-default-sec = "0"
