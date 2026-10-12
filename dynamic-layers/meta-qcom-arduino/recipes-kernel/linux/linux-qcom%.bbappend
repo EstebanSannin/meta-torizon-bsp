@@ -4,3 +4,5 @@ SRC_URI:append:ventuno-q = " file://0001-arm64-dts-qcom-monaco-arduino-monza-pow
     file://0002-arm64-dts-qcom-monaco-arduino-monza-enable-the-USB-link-to-the-MCU.patch \
     file://ventuno-q-edid.cfg \
 "
+
+SRC_URI:append:uno-q = " file://uno-q-rtc.cfg"
