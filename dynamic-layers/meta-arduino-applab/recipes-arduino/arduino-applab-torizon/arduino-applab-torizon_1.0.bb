@@ -9,6 +9,7 @@ SRC_URI = " \
     file://arduino-applab-torizon.tmpfiles \
     file://torizon-cloud \
     file://90-arduino-applab-torizon-cloud \
+    file://60-arduino-applab-sshd.conf \
 "
 
 S = "${UNPACKDIR}"
@@ -29,6 +30,8 @@ do_install() {
     # Torizon Cloud from App Lab (status, provisioning)
     install -D -m 0755 ${S}/torizon-cloud ${D}${libexecdir}/arduino-applab/torizon-cloud
     install -D -m 0440 ${S}/90-arduino-applab-torizon-cloud ${D}${sysconfdir}/sudoers.d/90-arduino-applab-torizon-cloud
+    # App Lab multiplexes many channels over one SSH connection
+    install -D -m 0644 ${S}/60-arduino-applab-sshd.conf ${D}${sysconfdir}/ssh/sshd_config.d/60-arduino-applab.conf
 }
 
 FILES:${PN} += "${nonarch_libdir}/tmpfiles.d ${libexecdir}/arduino-applab"
