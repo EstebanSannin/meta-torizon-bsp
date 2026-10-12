@@ -122,9 +122,8 @@ Known limitations
  * On the UNO Q, U-Boot (in `boot_a`/`boot_b`) is not updated through Torizon OTA either.
  * On the UNO Q, the Android bootloader stops in fastboot after a few boots unless the
    boot slot is marked as successful. `qbootctl` (from meta-qcom) does it at every boot.
- * The UNO Q has no battery-backed RTC: until NTP synchronizes the clock after boot,
-   TLS connections (and so Torizon Cloud) fail, and the first report after an update can
-   take a few minutes.
+ * The UNO Q has no battery-backed RTC: after a power loss the clock starts at the last time
+   saved by `systemd-timesyncd` (or the image build time) until NTP synchronizes it.
  * On the UNO Q, `adsprpcd_audiopd.service` fails at boot: the QCM2290 device tree
    reserves no memory for the audio DSP process, and the board has no sound card.
    `systemd-networkd-wait-online.service` fails without a wired network.
