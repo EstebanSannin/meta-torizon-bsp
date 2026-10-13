@@ -93,9 +93,6 @@ Known limitations
  * The boot firmware (XBL, UEFI) is not updated through Torizon OTA.
  * On the VENTUNO Q the USB controller of the MCU link (`usb_2`) stops detecting devices
    once the USB gadget is bound at boot; `ventuno-q-usb2-reset.service` restarts it once.
- * After a warm reboot the Ethernet interface occasionally receives no packets (no DHCP
-   lease) although the link is up; `ip link set eth0 down && ip link set eth0 up`
-   recovers it.
  * No permanent Ethernet MAC address is provided to Linux, so a random one is used. The
    DHCP address stays stable, as the client ID is derived from the machine ID.
  * meta-qcom CI applies extra patches to meta-lts-mixins for other SoCs (shikra, qcs615);
