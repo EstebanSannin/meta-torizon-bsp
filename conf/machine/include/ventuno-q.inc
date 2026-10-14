@@ -3,3 +3,6 @@
 # template, on top of the machine from meta-qcom-arduino.
 
 require common-qcom.inc
+
+# usb_2 (link to the MCU) cannot detect devices after boot until restarted
+MACHINE_EXTRA_RRECOMMENDS:append = " ventuno-q-usb2-reset"
