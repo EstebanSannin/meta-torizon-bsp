@@ -6,3 +6,7 @@ require common-qcom.inc
 
 # usb_2 (link to the MCU) cannot detect devices after boot until restarted
 MACHINE_EXTRA_RRECOMMENDS:append = " ventuno-q-usb2-reset"
+
+# The HDMI EDID of the monitor is not read (1024x768): default to 1080p60
+MACHINE_EXTRA_RRECOMMENDS:append = " ventuno-q-edid"
+OSTREE_KERNEL_ARGS:append = " drm.edid_firmware=HDMI-A-1:edid/1080p60.bin"
