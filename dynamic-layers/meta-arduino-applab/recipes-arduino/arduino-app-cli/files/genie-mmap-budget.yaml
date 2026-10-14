@@ -1,0 +1,9 @@
+    # Map large models in 64 MiB chunks ("mmap-budget"): loaded at once, their
+    # weights do not fit the NPU address window of the mainline fastrpc driver
+    command:
+      - sh
+      - -c
+      - >-
+        sed -i 's/"mmap-budget": 0,/"mmap-budget": 64,/'
+        /mnt/work/models/*/genie_config.json /mnt/work/models/*/text-generator.json 2>/dev/null;
+        exec hypercorn openapi_server.main:app --bind 0.0.0.0:${GENAI_PORT:-9001}
