@@ -1,0 +1,51 @@
+From 88d37d46c4d5ae132de0737fe9a6eb76e4e961e7 Mon Sep 17 00:00:00 2001
+From: Stefano Viola <stefano.viola@toradex.com>
+Date: Thu, 15 Oct 2026 15:04:44 +0200
+Subject: [PATCH] arm64: dts: qcom: monaco-arduino-monza: enable the USB link
+ to the MCU
+
+The STM32 MCU is connected to usb_2 (the Bridge to Linux and gs_usb CAN),
+but the host never sees it: PMIC GPIO 7 (usb2-en) stays low. Arduino's
+Ubuntu image drives it high from usb_2's default pin state. Do the same.
+
+Upstream-Status: Pending
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Stefano Viola <stefano.viola@toradex.com>
+---
+ arch/arm64/boot/dts/qcom/monaco-arduino-monza.dts | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/qcom/monaco-arduino-monza.dts b/arch/arm64/boot/dts/qcom/monaco-arduino-monza.dts
+index 8b1568290cb1..8f440483968e 100644
+--- a/arch/arm64/boot/dts/qcom/monaco-arduino-monza.dts
++++ b/arch/arm64/boot/dts/qcom/monaco-arduino-monza.dts
+@@ -616,6 +616,16 @@ &pcieport1 {
+ 	reset-gpios = <&tlmm 23 GPIO_ACTIVE_LOW>;
+ };
+ 
++&pmm8650au_1_gpios {
++	/* Enables the USB link to the MCU, as on Arduino's Ubuntu image */
++	usb2_en: usb2-en-state {
++		pins = "gpio7";
++		function = "normal";
++		output-high;
++		power-source = <0>;
++	};
++};
++
+ &thermal_zones {
+ 	cpuss-0-0-thermal {
+ 		/*
+@@ -836,6 +846,9 @@ &usb_1_dwc3_ss {
+ 
+ /* Internally connected to the MCU (e.g. for DFU). */
+ &usb_2 {
++	pinctrl-0 = <&usb2_en>;
++	pinctrl-names = "default";
++
+ 	dr_mode = "host";
+ 
+ 	status = "okay";
+-- 
+2.43.0
+
