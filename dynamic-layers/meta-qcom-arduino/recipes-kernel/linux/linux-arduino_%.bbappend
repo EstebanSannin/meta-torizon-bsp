@@ -13,12 +13,14 @@ LINUX_VERSION:ventuno-q = "7.2.8"
 # qcom-v7.2.8-arduino, 2026-10-14
 SRCREV:ventuno-q = "b5aaba71a68946fd4a8b57c649f6ebd5beb6180e"
 
+# 0003 fixes Wi-Fi and the TUSB7340 behind the PCIe switch (BDF to SID table).
 # Already in this tree, so not carried: the QCA2066 power sequencer (replaces
 # the Wi-Fi/BT GPIO hogs), the qcom-ethqos SerDes series from v7.1 and the
 # fastrpc_user refcount the fastrpc fix builds on.
 SRC_URI:append:ventuno-q = " \
     file://0001-arm64-dts-qcom-monaco-arduino-monza-enable-the-USB-link-to-the-MCU.patch \
     file://0002-misc-fastrpc-drop-leftover-invoke-contexts-on-release.patch \
+    file://0003-PCI-qcom-honour-iommu-cells-in-the-BDF-to-SID-table.patch \
     file://configs/ventuno-q.cfg \
     file://qcom-bsp-additions.cfg \
     file://torizon.cfg \
