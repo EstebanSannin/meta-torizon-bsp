@@ -1,0 +1,29 @@
+From 686bd3573b719b7a4c95db5974e87e2a5f9c0666 Mon Sep 17 00:00:00 2001
+From: Stefano Viola <stefano.viola@toradex.com>
+Date: Fri, 6 Nov 2026 01:20:57 +0100
+Subject: [PATCH] rpi: copy the Bluetooth address through the bluetooth alias
+
+The firmware sets local-bd-address on the Bluetooth node, but U-Boot
+only copies it from the Raspberry Pi 4 path. On the Raspberry Pi 5 the
+node is under /soc@107c000000, so Linux uses the default controller
+address and the controller stays unconfigured. Also copy it through the
+bluetooth alias, which points to the right node.
+
+Upstream-Status: Pending
+Signed-off-by: Stefano Viola <stefano.viola@toradex.com>
+---
+ board/raspberrypi/rpi/rpi.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/board/raspberrypi/rpi/rpi.c b/board/raspberrypi/rpi/rpi.c
+index f9b643555dd..04ac0c20ce3 100644
+--- a/board/raspberrypi/rpi/rpi.c
++++ b/board/raspberrypi/rpi/rpi.c
+@@ -613,6 +613,7 @@ void  update_fdt_from_fw(void *fdt, void *fw_fdt)
+ 
+ 	/* Bluetooth device address as provided by the firmware */
+ 	copy_property(fdt, fw_fdt, "/soc/serial@7e201000/bluetooth", "local-bd-address");
++	copy_property(fdt, fw_fdt, "bluetooth", "local-bd-address");
+ 
+ 	/* copy uart clk as provided by the firmware */
+ 	copy_property(fdt, fw_fdt, "/clocks/clk-uart", "clock-frequency");

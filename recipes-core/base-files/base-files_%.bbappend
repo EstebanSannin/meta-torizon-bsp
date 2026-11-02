@@ -2,6 +2,7 @@ FILESEXTRAPATHS:prepend := "${THISDIR}/${BPN}:"
 SRC_URI += " \
   file://x86/fstab \
   file://beagley-ai/fstab \
+  file://raspberrypi5/fstab \
 "
 
 do_install:append:intel-x86-common() {
@@ -12,6 +13,11 @@ do_install:append:intel-x86-common() {
 do_install:append:beagley-ai() {
 	install -d ${D}/boot/vendor_boot
     install -m 644 ${UNPACKDIR}/beagley-ai/fstab ${D}${sysconfdir}/fstab
+}
+
+do_install:append:raspberrypi5() {
+	install -d ${D}/boot/vendor_boot
+	install -m 644 ${UNPACKDIR}/raspberrypi5/fstab ${D}${sysconfdir}/fstab
 }
 
 remove_dev_root_from_fstab() {

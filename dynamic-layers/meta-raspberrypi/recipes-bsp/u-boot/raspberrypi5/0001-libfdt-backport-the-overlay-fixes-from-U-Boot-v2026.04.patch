@@ -1,0 +1,2576 @@
+From eee94752485b4f969b714073fb43bf58a34c494f Mon Sep 17 00:00:00 2001
+From: Stefano Viola <stefano.viola@toradex.com>
+Date: Fri, 6 Nov 2026 00:34:12 +0100
+Subject: [PATCH] libfdt: backport the overlay fixes from U-Boot v2026.04
+
+U-Boot v2026.01 has an old libfdt that cannot apply an overlay giving a
+phandle to a node that already exists in the base device tree, like the
+Raspberry Pi vc4-kms-v3d-pi5 overlay: fdt apply fails with
+FDT_ERR_NOTFOUND. Take scripts/dtc/libfdt from upstream, as synced to
+dtc v1.7.2 for U-Boot v2026.04.
+
+Upstream-Status: Backport [0535e46d55d, c6faf583c4c]
+Signed-off-by: Stefano Viola <stefano.viola@toradex.com>
+---
+ scripts/dtc/libfdt/fdt.c             |  84 +++---
+ scripts/dtc/libfdt/fdt.h             |   4 +-
+ scripts/dtc/libfdt/fdt_addresses.c   |   2 +-
+ scripts/dtc/libfdt/fdt_overlay.c     | 389 +++++++++++++++++++------
+ scripts/dtc/libfdt/fdt_ro.c          | 100 ++++---
+ scripts/dtc/libfdt/fdt_rw.c          | 101 ++++---
+ scripts/dtc/libfdt/fdt_strerror.c    |   1 +
+ scripts/dtc/libfdt/fdt_sw.c          |  26 +-
+ scripts/dtc/libfdt/libfdt.h          | 414 ++++++++++++++++++++++-----
+ scripts/dtc/libfdt/libfdt_internal.h | 141 ++++++---
+ tools/libfdt/fdt_rw.c                |   2 +-
+ 11 files changed, 941 insertions(+), 323 deletions(-)
+
+diff --git a/scripts/dtc/libfdt/fdt.c b/scripts/dtc/libfdt/fdt.c
+index 28f4e1a5f15..95f644c31f9 100644
+--- a/scripts/dtc/libfdt/fdt.c
++++ b/scripts/dtc/libfdt/fdt.c
+@@ -19,9 +19,16 @@ int32_t fdt_ro_probe_(const void *fdt)
+ {
+ 	uint32_t totalsize = fdt_totalsize(fdt);
+ 
++	if (can_assume(VALID_DTB))
++		return totalsize;
++
++	/* The device tree must be at an 8-byte aligned address */
++	if ((uintptr_t)fdt & 7)
++		return -FDT_ERR_ALIGNMENT;
++
+ 	if (fdt_magic(fdt) == FDT_MAGIC) {
+ 		/* Complete tree */
+-		if (fdt_chk_version()) {
++		if (!can_assume(LATEST)) {
+ 			if (fdt_version(fdt) < FDT_FIRST_SUPPORTED_VERSION)
+ 				return -FDT_ERR_BADVERSION;
+ 			if (fdt_last_comp_version(fdt) >
+@@ -30,7 +37,7 @@ int32_t fdt_ro_probe_(const void *fdt)
+ 		}
+ 	} else if (fdt_magic(fdt) == FDT_SW_MAGIC) {
+ 		/* Unfinished sequential-write blob */
+-		if (fdt_size_dt_struct(fdt) == 0)
++		if (!can_assume(VALID_INPUT) && fdt_size_dt_struct(fdt) == 0)
+ 			return -FDT_ERR_BADSTATE;
+ 	} else {
+ 		return -FDT_ERR_BADMAGIC;
+@@ -75,17 +82,21 @@ size_t fdt_header_size_(uint32_t version)
+ 
+ size_t fdt_header_size(const void *fdt)
+ {
+-	return fdt_chk_version() ? fdt_header_size_(fdt_version(fdt)) :
+-		FDT_V17_SIZE;
++	return can_assume(LATEST) ? FDT_V17_SIZE :
++		fdt_header_size_(fdt_version(fdt));
+ }
+ 
+ int fdt_check_header(const void *fdt)
+ {
+ 	size_t hdrsize;
+ 
++	/* The device tree must be at an 8-byte aligned address */
++	if ((uintptr_t)fdt & 7)
++		return -FDT_ERR_ALIGNMENT;
++
+ 	if (fdt_magic(fdt) != FDT_MAGIC)
+ 		return -FDT_ERR_BADMAGIC;
+-	if (fdt_chk_version()) {
++	if (!can_assume(LATEST)) {
+ 		if ((fdt_version(fdt) < FDT_FIRST_SUPPORTED_VERSION)
+ 		    || (fdt_last_comp_version(fdt) >
+ 			FDT_LAST_SUPPORTED_VERSION))
+@@ -94,8 +105,7 @@ int fdt_check_header(const void *fdt)
+ 			return -FDT_ERR_BADVERSION;
+ 	}
+ 	hdrsize = fdt_header_size(fdt);
+-	if (fdt_chk_basic()) {
+-
++	if (!can_assume(VALID_DTB)) {
+ 		if ((fdt_totalsize(fdt) < hdrsize)
+ 		    || (fdt_totalsize(fdt) > INT_MAX))
+ 			return -FDT_ERR_TRUNCATED;
+@@ -104,11 +114,9 @@ int fdt_check_header(const void *fdt)
+ 		if (!check_off_(hdrsize, fdt_totalsize(fdt),
+ 				fdt_off_mem_rsvmap(fdt)))
+ 			return -FDT_ERR_TRUNCATED;
+-	}
+ 
+-	if (fdt_chk_extra()) {
+ 		/* Bounds check structure block */
+-		if (fdt_chk_version() && fdt_version(fdt) < 17) {
++		if (!can_assume(LATEST) && fdt_version(fdt) < 17) {
+ 			if (!check_off_(hdrsize, fdt_totalsize(fdt),
+ 					fdt_off_dt_struct(fdt)))
+ 				return -FDT_ERR_TRUNCATED;
+@@ -137,13 +145,13 @@ const void *fdt_offset_ptr(const void *fdt, int offset, unsigned int len)
+ 	if (offset < 0)
+ 		return NULL;
+ 
+-	if (fdt_chk_basic())
++	if (!can_assume(VALID_INPUT))
+ 		if ((absoffset < uoffset)
+ 		    || ((absoffset + len) < absoffset)
+ 		    || (absoffset + len) > fdt_totalsize(fdt))
+ 			return NULL;
+ 
+-	if (!fdt_chk_version() || fdt_version(fdt) >= 0x11)
++	if (can_assume(LATEST) || fdt_version(fdt) >= 0x11)
+ 		if (((uoffset + len) < uoffset)
+ 		    || ((offset + len) > fdt_size_dt_struct(fdt)))
+ 			return NULL;
+@@ -154,13 +162,13 @@ const void *fdt_offset_ptr(const void *fdt, int offset, unsigned int len)
+ uint32_t fdt_next_tag(const void *fdt, int startoffset, int *nextoffset)
+ {
+ 	const fdt32_t *tagp, *lenp;
+-	uint32_t tag;
++	uint32_t tag, len, sum;
+ 	int offset = startoffset;
+ 	const char *p;
+ 
+ 	*nextoffset = -FDT_ERR_TRUNCATED;
+ 	tagp = fdt_offset_ptr(fdt, offset, FDT_TAGSIZE);
+-	if (fdt_chk_basic() && !tagp)
++	if (!can_assume(VALID_DTB) && !tagp)
+ 		return FDT_END; /* premature end */
+ 	tag = fdt32_to_cpu(*tagp);
+ 	offset += FDT_TAGSIZE;
+@@ -172,20 +180,27 @@ uint32_t fdt_next_tag(const void *fdt, int startoffset, int *nextoffset)
+ 		do {
+ 			p = fdt_offset_ptr(fdt, offset++, 1);
+ 		} while (p && (*p != '\0'));
+-		if (fdt_chk_basic() && !p)
++		if (!can_assume(VALID_DTB) && !p)
+ 			return FDT_END; /* premature end */
+ 		break;
+ 
+ 	case FDT_PROP:
+ 		lenp = fdt_offset_ptr(fdt, offset, sizeof(*lenp));
+-		if (fdt_chk_basic() && !lenp)
++		if (!can_assume(VALID_DTB) && !lenp)
+ 			return FDT_END; /* premature end */
++
++		len = fdt32_to_cpu(*lenp);
++		sum = len + offset;
++		if (!can_assume(VALID_DTB) &&
++		    (INT_MAX <= sum || sum < (uint32_t) offset))
++			return FDT_END; /* premature end */
++
+ 		/* skip-name offset, length and value */
+-		offset += sizeof(struct fdt_property) - FDT_TAGSIZE
+-			+ fdt32_to_cpu(*lenp);
+-		if (fdt_chk_version() &&
+-		    fdt_version(fdt) < 0x10 && fdt32_to_cpu(*lenp) >= 8 &&
+-		    ((offset - fdt32_to_cpu(*lenp)) % 8) != 0)
++		offset += sizeof(struct fdt_property) - FDT_TAGSIZE + len;
++
++		if (!can_assume(LATEST) &&
++		    fdt_version(fdt) < 0x10 && len >= 8 &&
++		    ((offset - len) % 8) != 0)
+ 			offset += 4;
+ 		break;
+ 
+@@ -198,8 +213,7 @@ uint32_t fdt_next_tag(const void *fdt, int startoffset, int *nextoffset)
+ 		return FDT_END;
+ 	}
+ 
+-	if (fdt_chk_basic() &&
+-	    !fdt_offset_ptr(fdt, startoffset, offset - startoffset))
++	if (!fdt_offset_ptr(fdt, startoffset, offset - startoffset))
+ 		return FDT_END; /* premature end */
+ 
+ 	*nextoffset = FDT_TAGALIGN(offset);
+@@ -208,8 +222,11 @@ uint32_t fdt_next_tag(const void *fdt, int startoffset, int *nextoffset)
+ 
+ int fdt_check_node_offset_(const void *fdt, int offset)
+ {
+-	if ((offset < 0) || (offset % FDT_TAGSIZE)
+-	    || (fdt_next_tag(fdt, offset, &offset) != FDT_BEGIN_NODE))
++	if (!can_assume(VALID_INPUT)
++	    && ((offset < 0) || (offset % FDT_TAGSIZE)))
++		return -FDT_ERR_BADOFFSET;
++
++	if (fdt_next_tag(fdt, offset, &offset) != FDT_BEGIN_NODE)
+ 		return -FDT_ERR_BADOFFSET;
+ 
+ 	return offset;
+@@ -217,8 +234,11 @@ int fdt_check_node_offset_(const void *fdt, int offset)
+ 
+ int fdt_check_prop_offset_(const void *fdt, int offset)
+ {
+-	if ((offset < 0) || (offset % FDT_TAGSIZE)
+-	    || (fdt_next_tag(fdt, offset, &offset) != FDT_PROP))
++	if (!can_assume(VALID_INPUT)
++	    && ((offset < 0) || (offset % FDT_TAGSIZE)))
++		return -FDT_ERR_BADOFFSET;
++
++	if (fdt_next_tag(fdt, offset, &offset) != FDT_PROP)
+ 		return -FDT_ERR_BADOFFSET;
+ 
+ 	return offset;
+@@ -292,21 +312,21 @@ int fdt_next_subnode(const void *fdt, int offset)
+ 	return offset;
+ }
+ 
+-const char *fdt_find_string_(const char *strtab, int tabsize, const char *s)
++const char *fdt_find_string_len_(const char *strtab, int tabsize, const char *s,
++				 int slen)
+ {
+-	int len = strlen(s) + 1;
+-	const char *last = strtab + tabsize - len;
++	const char *last = strtab + tabsize - (slen + 1);
+ 	const char *p;
+ 
+ 	for (p = strtab; p <= last; p++)
+-		if (memcmp(p, s, len) == 0)
++		if (memcmp(p, s, slen) == 0 && p[slen] == '\0')
+ 			return p;
+ 	return NULL;
+ }
+ 
+ int fdt_move(const void *fdt, void *buf, int bufsize)
+ {
+-	if (fdt_chk_basic() && bufsize < 0)
++	if (!can_assume(VALID_INPUT) && bufsize < 0)
+ 		return -FDT_ERR_NOSPACE;
+ 
+ 	FDT_RO_PROBE(fdt);
+diff --git a/scripts/dtc/libfdt/fdt.h b/scripts/dtc/libfdt/fdt.h
+index f2e68807f27..c6e4d7838dc 100644
+--- a/scripts/dtc/libfdt/fdt.h
++++ b/scripts/dtc/libfdt/fdt.h
+@@ -7,7 +7,7 @@
+  * Copyright 2012 Kim Phillips, Freescale Semiconductor.
+  */
+ 
+-#ifndef __ASSEMBLY__
++#ifndef __ASSEMBLER__
+ 
+ struct fdt_header {
+ 	fdt32_t magic;			 /* magic word FDT_MAGIC */
+@@ -45,7 +45,7 @@ struct fdt_property {
+ 	char data[0];
+ };
+ 
+-#endif /* !__ASSEMBLY */
++#endif /* !__ASSEMBLER__ */
+ 
+ #define FDT_MAGIC	0xd00dfeed	/* 4: version, 4: total size */
+ #define FDT_TAGSIZE	sizeof(fdt32_t)
+diff --git a/scripts/dtc/libfdt/fdt_addresses.c b/scripts/dtc/libfdt/fdt_addresses.c
+index 9a82cd0ba2f..c40ba094f1f 100644
+--- a/scripts/dtc/libfdt/fdt_addresses.c
++++ b/scripts/dtc/libfdt/fdt_addresses.c
+@@ -73,7 +73,7 @@ int fdt_appendprop_addrrange(void *fdt, int parent, int nodeoffset,
+ 	/* check validity of address */
+ 	prop = data;
+ 	if (addr_cells == 1) {
+-		if ((addr > UINT32_MAX) || ((UINT32_MAX + 1 - addr) < size))
++		if ((addr > UINT32_MAX) || (((uint64_t) UINT32_MAX + 1 - addr) < size))
+ 			return -FDT_ERR_BADVALUE;
+ 
+ 		fdt32_st(prop, (uint32_t)addr);
+diff --git a/scripts/dtc/libfdt/fdt_overlay.c b/scripts/dtc/libfdt/fdt_overlay.c
+index 7a65c35af6f..e40cfe8c3c7 100644
+--- a/scripts/dtc/libfdt/fdt_overlay.c
++++ b/scripts/dtc/libfdt/fdt_overlay.c
+@@ -40,37 +40,22 @@ static uint32_t overlay_get_target_phandle(const void *fdto, int fragment)
+ 	return fdt32_to_cpu(*val);
+ }
+ 
+-/**
+- * overlay_get_target - retrieves the offset of a fragment's target
+- * @fdt: Base device tree blob
+- * @fdto: Device tree overlay blob
+- * @fragment: node offset of the fragment in the overlay
+- * @pathp: pointer which receives the path of the target (or NULL)
+- *
+- * overlay_get_target() retrieves the target offset in the base
+- * device tree of a fragment, no matter how the actual targeting is
+- * done (through a phandle or a path)
+- *
+- * returns:
+- *      the targeted node offset in the base device tree
+- *      Negative error code on error
+- */
+-static int overlay_get_target(const void *fdt, const void *fdto,
+-			      int fragment, char const **pathp)
++int fdt_overlay_target_offset(const void *fdt, const void *fdto,
++			      int fragment_offset, char const **pathp)
+ {
+ 	uint32_t phandle;
+ 	const char *path = NULL;
+ 	int path_len = 0, ret;
+ 
+ 	/* Try first to do a phandle based lookup */
+-	phandle = overlay_get_target_phandle(fdto, fragment);
++	phandle = overlay_get_target_phandle(fdto, fragment_offset);
+ 	if (phandle == (uint32_t)-1)
+ 		return -FDT_ERR_BADPHANDLE;
+ 
+ 	/* no phandle, try path */
+ 	if (!phandle) {
+ 		/* And then a path based lookup */
+-		path = fdt_getprop(fdto, fragment, "target-path", &path_len);
++		path = fdt_getprop(fdto, fragment_offset, "target-path", &path_len);
+ 		if (path)
+ 			ret = fdt_path_offset(fdt, path);
+ 		else
+@@ -116,26 +101,22 @@ static int overlay_get_target(const void *fdt, const void *fdto,
+ static int overlay_phandle_add_offset(void *fdt, int node,
+ 				      const char *name, uint32_t delta)
+ {
+-	const fdt32_t *val;
+-	uint32_t adj_val;
++	fdt32_t *valp, val;
+ 	int len;
+ 
+-	val = fdt_getprop(fdt, node, name, &len);
+-	if (!val)
++	valp = fdt_getprop_w(fdt, node, name, &len);
++	if (!valp)
+ 		return len;
+ 
+-	if (len != sizeof(*val))
++	if (len != sizeof(val))
+ 		return -FDT_ERR_BADPHANDLE;
+ 
+-	adj_val = fdt32_to_cpu(*val);
+-	if ((adj_val + delta) < adj_val)
++	val = fdt32_ld(valp);
++	if (val + delta < val || val + delta == (uint32_t)-1)
+ 		return -FDT_ERR_NOPHANDLES;
+ 
+-	adj_val += delta;
+-	if (adj_val == (uint32_t)-1)
+-		return -FDT_ERR_NOPHANDLES;
+-
+-	return fdt_setprop_inplace_u32(fdt, node, name, adj_val);
++	fdt32_st(valp, val + delta);
++	return 0;
+ }
+ 
+ /**
+@@ -228,8 +209,8 @@ static int overlay_update_local_node_references(void *fdto,
+ 
+ 	fdt_for_each_property_offset(fixup_prop, fdto, fixup_node) {
+ 		const fdt32_t *fixup_val;
+-		const char *tree_val;
+ 		const char *name;
++		char *tree_val;
+ 		int fixup_len;
+ 		int tree_len;
+ 		int i;
+@@ -243,7 +224,7 @@ static int overlay_update_local_node_references(void *fdto,
+ 			return -FDT_ERR_BADOVERLAY;
+ 		fixup_len /= sizeof(uint32_t);
+ 
+-		tree_val = fdt_getprop(fdto, tree_node, name, &tree_len);
++		tree_val = fdt_getprop_w(fdto, tree_node, name, &tree_len);
+ 		if (!tree_val) {
+ 			if (tree_len == -FDT_ERR_NOTFOUND)
+ 				return -FDT_ERR_BADOVERLAY;
+@@ -252,33 +233,15 @@ static int overlay_update_local_node_references(void *fdto,
+ 		}
+ 
+ 		for (i = 0; i < fixup_len; i++) {
+-			fdt32_t adj_val;
+-			uint32_t poffset;
++			fdt32_t *refp;
+ 
+-			poffset = fdt32_to_cpu(fixup_val[i]);
++			refp = (fdt32_t *)(tree_val + fdt32_ld_(fixup_val + i));
+ 
+ 			/*
+-			 * phandles to fixup can be unaligned.
+-			 *
+-			 * Use a memcpy for the architectures that do
+-			 * not support unaligned accesses.
++			 * phandles to fixup can be unaligned, so use
++			 * fdt32_{ld,st}() to read/write them.
+ 			 */
+-			memcpy(&adj_val, tree_val + poffset, sizeof(adj_val));
+-
+-			adj_val = cpu_to_fdt32(fdt32_to_cpu(adj_val) + delta);
+-
+-			ret = fdt_setprop_inplace_namelen_partial(fdto,
+-								  tree_node,
+-								  name,
+-								  strlen(name),
+-								  poffset,
+-								  &adj_val,
+-								  sizeof(adj_val));
+-			if (ret == -FDT_ERR_NOSPACE)
+-				return -FDT_ERR_BADOVERLAY;
+-
+-			if (ret)
+-				return ret;
++			fdt32_st(refp, fdt32_ld(refp) + delta);
+ 		}
+ 	}
+ 
+@@ -344,7 +307,6 @@ static int overlay_update_local_references(void *fdto, uint32_t delta)
+ 
+ /**
+  * overlay_fixup_one_phandle - Set an overlay phandle to the base one
+- * @fdt: Base Device Tree blob
+  * @fdto: Device tree overlay blob
+  * @symbols_off: Node offset of the symbols node in the base device tree
+  * @path: Path to a node holding a phandle in the overlay
+@@ -352,7 +314,7 @@ static int overlay_update_local_references(void *fdto, uint32_t delta)
+  * @name: Name of the property holding the phandle reference in the overlay
+  * @name_len: number of name characters to consider
+  * @poffset: Offset within the overlay property where the phandle is stored
+- * @label: Label of the node referenced by the phandle
++ * @phandle: Phandle referencing the node
+  *
+  * overlay_fixup_one_phandle() resolves an overlay phandle pointing to
+  * a node in the base device tree.
+@@ -365,34 +327,17 @@ static int overlay_update_local_references(void *fdto, uint32_t delta)
+  *      0 on success
+  *      Negative error code on failure
+  */
+-static int overlay_fixup_one_phandle(void *fdt, void *fdto,
+-				     int symbols_off,
++static int overlay_fixup_one_phandle(void *fdto, int symbols_off,
+ 				     const char *path, uint32_t path_len,
+ 				     const char *name, uint32_t name_len,
+-				     int poffset, const char *label)
++				     int poffset, uint32_t phandle)
+ {
+-	const char *symbol_path;
+-	uint32_t phandle;
+ 	fdt32_t phandle_prop;
+-	int symbol_off, fixup_off;
+-	int prop_len;
++	int fixup_off;
+ 
+ 	if (symbols_off < 0)
+ 		return symbols_off;
+ 
+-	symbol_path = fdt_getprop(fdt, symbols_off, label,
+-				  &prop_len);
+-	if (!symbol_path)
+-		return prop_len;
+-
+-	symbol_off = fdt_path_offset(fdt, symbol_path);
+-	if (symbol_off < 0)
+-		return symbol_off;
+-
+-	phandle = fdt_get_phandle(fdt, symbol_off);
+-	if (!phandle)
+-		return -FDT_ERR_NOTFOUND;
+-
+ 	fixup_off = fdt_path_offset_namelen(fdto, path, path_len);
+ 	if (fixup_off == -FDT_ERR_NOTFOUND)
+ 		return -FDT_ERR_BADOVERLAY;
+@@ -404,7 +349,7 @@ static int overlay_fixup_one_phandle(void *fdt, void *fdto,
+ 						   name, name_len, poffset,
+ 						   &phandle_prop,
+ 						   sizeof(phandle_prop));
+-};
++}
+ 
+ /**
+  * overlay_fixup_phandle - Set an overlay phandle to the base one
+@@ -431,6 +376,10 @@ static int overlay_fixup_phandle(void *fdt, void *fdto, int symbols_off,
+ 	const char *value;
+ 	const char *label;
+ 	int len;
++	const char *symbol_path;
++	int prop_len;
++	int symbol_off;
++	uint32_t phandle;
+ 
+ 	value = fdt_getprop_by_offset(fdto, property,
+ 				      &label, &len);
+@@ -441,12 +390,25 @@ static int overlay_fixup_phandle(void *fdt, void *fdto, int symbols_off,
+ 		return len;
+ 	}
+ 
++	symbol_path = fdt_getprop(fdt, symbols_off, label, &prop_len);
++	if (!symbol_path)
++		return prop_len;
++
++	symbol_off = fdt_path_offset(fdt, symbol_path);
++	if (symbol_off < 0)
++		return symbol_off;
++
++	phandle = fdt_get_phandle(fdt, symbol_off);
++	if (!phandle)
++		return -FDT_ERR_NOTFOUND;
++
+ 	do {
+ 		const char *path, *name, *fixup_end;
+ 		const char *fixup_str = value;
+ 		uint32_t path_len, name_len;
+ 		uint32_t fixup_len;
+-		char *sep, *endptr;
++		const char *sep;
++		char *endptr;
+ 		int poffset, ret;
+ 
+ 		fixup_end = memchr(value, '\0', len);
+@@ -480,9 +442,9 @@ static int overlay_fixup_phandle(void *fdt, void *fdto, int symbols_off,
+ 		if ((*endptr != '\0') || (endptr <= (sep + 1)))
+ 			return -FDT_ERR_BADOVERLAY;
+ 
+-		ret = overlay_fixup_one_phandle(fdt, fdto, symbols_off,
++		ret = overlay_fixup_one_phandle(fdto, symbols_off,
+ 						path, path_len, name, name_len,
+-						poffset, label);
++						poffset, phandle);
+ 		if (ret)
+ 			return ret;
+ 	} while (len > 0);
+@@ -535,6 +497,255 @@ static int overlay_fixup_phandles(void *fdt, void *fdto)
+ 	return 0;
+ }
+ 
++/**
++ * overlay_adjust_local_conflicting_phandle: Changes a phandle value
++ * @fdto: Device tree overlay
++ * @node: The node the phandle is set for
++ * @fdt_phandle: The new value for the phandle
++ *
++ * returns:
++ *      0 on success
++ *      Negative error code on failure
++ */
++static int overlay_adjust_local_conflicting_phandle(void *fdto, int node,
++						    uint32_t fdt_phandle)
++{
++	const fdt32_t *php;
++	int len, ret;
++
++	php = fdt_getprop(fdto, node, "phandle", &len);
++	if (php && len == sizeof(*php)) {
++		ret = fdt_setprop_inplace_u32(fdto, node, "phandle", fdt_phandle);
++		if (ret)
++			return ret;
++	}
++
++	php = fdt_getprop(fdto, node, "linux,phandle", &len);
++	if (php && len == sizeof(*php)) {
++		ret = fdt_setprop_inplace_u32(fdto, node, "linux,phandle", fdt_phandle);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
++/**
++ * overlay_update_node_conflicting_references - Recursively replace phandle values
++ * @fdto: Device tree overlay blob
++ * @tree_node: Node to recurse into
++ * @fixup_node: Node offset of the matching local fixups node
++ * @fdt_phandle: Value to replace phandles with
++ * @fdto_phandle: Value to be replaced
++ *
++ * Replaces all phandles with value @fdto_phandle by @fdt_phandle.
++ *
++ * returns:
++ *      0 on success
++ *      Negative error code on failure
++ */
++static int overlay_update_node_conflicting_references(void *fdto, int tree_node,
++						      int fixup_node,
++						      uint32_t fdt_phandle,
++						      uint32_t fdto_phandle)
++{
++	int fixup_prop;
++	int fixup_child;
++	int ret;
++
++	fdt_for_each_property_offset(fixup_prop, fdto, fixup_node) {
++		const fdt32_t *fixup_val;
++		const char *name;
++		char *tree_val;
++		int fixup_len;
++		int tree_len;
++		int i;
++
++		fixup_val = fdt_getprop_by_offset(fdto, fixup_prop,
++						  &name, &fixup_len);
++		if (!fixup_val)
++			return fixup_len;
++
++		if (fixup_len % sizeof(uint32_t))
++			return -FDT_ERR_BADOVERLAY;
++		fixup_len /= sizeof(uint32_t);
++
++		tree_val = fdt_getprop_w(fdto, tree_node, name, &tree_len);
++		if (!tree_val) {
++			if (tree_len == -FDT_ERR_NOTFOUND)
++				return -FDT_ERR_BADOVERLAY;
++
++			return tree_len;
++		}
++
++		for (i = 0; i < fixup_len; i++) {
++			fdt32_t *refp;
++			uint32_t valp;
++
++			refp = (fdt32_t *)(tree_val + fdt32_ld_(fixup_val + i));
++			valp = fdt32_ld(refp);
++
++			if (valp == fdto_phandle)
++				fdt32_st(refp, fdt_phandle);
++		}
++	}
++
++	fdt_for_each_subnode(fixup_child, fdto, fixup_node) {
++		const char *fixup_child_name = fdt_get_name(fdto, fixup_child, NULL);
++		int tree_child;
++
++		tree_child = fdt_subnode_offset(fdto, tree_node, fixup_child_name);
++
++		if (tree_child == -FDT_ERR_NOTFOUND)
++			return -FDT_ERR_BADOVERLAY;
++		if (tree_child < 0)
++			return tree_child;
++
++		ret = overlay_update_node_conflicting_references(fdto, tree_child,
++								 fixup_child,
++								 fdt_phandle,
++								 fdto_phandle);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
++/**
++ * overlay_update_local_conflicting_references - Recursively replace phandle values
++ * @fdto: Device tree overlay blob
++ * @fdt_phandle: Value to replace phandles with
++ * @fdto_phandle: Value to be replaced
++ *
++ * Replaces all phandles with value @fdto_phandle by @fdt_phandle.
++ *
++ * returns:
++ *      0 on success
++ *      Negative error code on failure
++ */
++static int overlay_update_local_conflicting_references(void *fdto,
++						       uint32_t fdt_phandle,
++						       uint32_t fdto_phandle)
++{
++	int fixups;
++
++	fixups = fdt_path_offset(fdto, "/__local_fixups__");
++	if (fixups == -FDT_ERR_NOTFOUND)
++		return 0;
++	if (fixups < 0)
++		return fixups;
++
++	return overlay_update_node_conflicting_references(fdto, 0, fixups,
++							  fdt_phandle,
++							  fdto_phandle);
++}
++
++/**
++ * overlay_prevent_phandle_overwrite_node - Helper function for overlay_prevent_phandle_overwrite
++ * @fdt: Base Device tree blob
++ * @fdtnode: Node in fdt that is checked for an overwrite
++ * @fdto: Device tree overlay blob
++ * @fdtonode: Node in fdto matching @fdtnode
++ *
++ * returns:
++ *      0 on success
++ *      Negative error code on failure
++ */
++static int overlay_prevent_phandle_overwrite_node(void *fdt, int fdtnode,
++						  void *fdto, int fdtonode)
++{
++	uint32_t fdt_phandle, fdto_phandle;
++	int fdtochild;
++
++	fdt_phandle = fdt_get_phandle(fdt, fdtnode);
++	fdto_phandle = fdt_get_phandle(fdto, fdtonode);
++
++	if (fdt_phandle && fdto_phandle) {
++		int ret;
++
++		ret = overlay_adjust_local_conflicting_phandle(fdto, fdtonode,
++							       fdt_phandle);
++		if (ret)
++			return ret;
++
++		ret = overlay_update_local_conflicting_references(fdto,
++								  fdt_phandle,
++								  fdto_phandle);
++		if (ret)
++			return ret;
++	}
++
++	fdt_for_each_subnode(fdtochild, fdto, fdtonode) {
++		const char *name = fdt_get_name(fdto, fdtochild, NULL);
++		int fdtchild;
++		int ret;
++
++		fdtchild = fdt_subnode_offset(fdt, fdtnode, name);
++		if (fdtchild == -FDT_ERR_NOTFOUND)
++			/*
++			 * no further overwrites possible here as this node is
++			 * new
++			 */
++			continue;
++
++		ret = overlay_prevent_phandle_overwrite_node(fdt, fdtchild,
++							     fdto, fdtochild);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
++/**
++ * overlay_prevent_phandle_overwrite - Fixes overlay phandles to not overwrite base phandles
++ * @fdt: Base Device Tree blob
++ * @fdto: Device tree overlay blob
++ *
++ * Checks recursively if applying fdto overwrites phandle values in the base
++ * dtb. When such a phandle is found, the fdto is changed to use the fdt's
++ * phandle value to not break references in the base.
++ *
++ * returns:
++ *      0 on success
++ *      Negative error code on failure
++ */
++static int overlay_prevent_phandle_overwrite(void *fdt, void *fdto)
++{
++	int fragment;
++
++	fdt_for_each_subnode(fragment, fdto, 0) {
++		int overlay;
++		int target;
++		int ret;
++
++		overlay = fdt_subnode_offset(fdto, fragment, "__overlay__");
++		if (overlay == -FDT_ERR_NOTFOUND)
++			continue;
++
++		if (overlay < 0)
++			return overlay;
++
++		target = fdt_overlay_target_offset(fdt, fdto, fragment, NULL);
++		if (target == -FDT_ERR_NOTFOUND)
++			/*
++			 * The subtree doesn't exist in the base, so nothing
++			 * will be overwritten.
++			 */
++			continue;
++		else if (target < 0)
++			return target;
++
++		ret = overlay_prevent_phandle_overwrite_node(fdt, target,
++							     fdto, overlay);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
+ /**
+  * overlay_apply_node - Merges a node into the base device tree
+  * @fdt: Base Device Tree blob
+@@ -636,7 +847,7 @@ static int overlay_merge(void *fdt, void *fdto)
+ 		if (overlay < 0)
+ 			return overlay;
+ 
+-		target = overlay_get_target(fdt, fdto, fragment, NULL);
++		target = fdt_overlay_target_offset(fdt, fdto, fragment, NULL);
+ 		if (target < 0)
+ 			return target;
+ 
+@@ -779,7 +990,7 @@ static int overlay_symbol_update(void *fdt, void *fdto)
+ 			return -FDT_ERR_BADOVERLAY;
+ 
+ 		/* get the target of the fragment */
+-		ret = overlay_get_target(fdt, fdto, fragment, &target_path);
++		ret = fdt_overlay_target_offset(fdt, fdto, fragment, &target_path);
+ 		if (ret < 0)
+ 			return ret;
+ 		target = ret;
+@@ -801,7 +1012,7 @@ static int overlay_symbol_update(void *fdt, void *fdto)
+ 
+ 		if (!target_path) {
+ 			/* again in case setprop_placeholder changed it */
+-			ret = overlay_get_target(fdt, fdto, fragment, &target_path);
++			ret = fdt_overlay_target_offset(fdt, fdto, fragment, &target_path);
+ 			if (ret < 0)
+ 				return ret;
+ 			target = ret;
+@@ -838,18 +1049,26 @@ int fdt_overlay_apply(void *fdt, void *fdto)
+ 	if (ret)
+ 		goto err;
+ 
++	/* Increase all phandles in the fdto by delta */
+ 	ret = overlay_adjust_local_phandles(fdto, delta);
+ 	if (ret)
+ 		goto err;
+ 
++	/* Adapt the phandle values in fdto to the above increase */
+ 	ret = overlay_update_local_references(fdto, delta);
+ 	if (ret)
+ 		goto err;
+ 
++	/* Update fdto's phandles using symbols from fdt */
+ 	ret = overlay_fixup_phandles(fdt, fdto);
+ 	if (ret)
+ 		goto err;
+ 
++	/* Don't overwrite phandles in fdt */
++	ret = overlay_prevent_phandle_overwrite(fdt, fdto);
++	if (ret)
++		goto err;
++
+ 	ret = overlay_merge(fdt, fdto);
+ 	if (ret)
+ 		goto err;
+diff --git a/scripts/dtc/libfdt/fdt_ro.c b/scripts/dtc/libfdt/fdt_ro.c
+index d65656aaa8b..3e7e26b4398 100644
+--- a/scripts/dtc/libfdt/fdt_ro.c
++++ b/scripts/dtc/libfdt/fdt_ro.c
+@@ -16,7 +16,7 @@ static int fdt_nodename_eq_(const void *fdt, int offset,
+ 	int olen;
+ 	const char *p = fdt_get_name(fdt, offset, &olen);
+ 
+-	if (!p || (fdt_chk_extra() && olen < len))
++	if (!p || olen < len)
+ 		/* short match */
+ 		return 0;
+ 
+@@ -39,7 +39,7 @@ const char *fdt_get_string(const void *fdt, int stroffset, int *lenp)
+ 	int err;
+ 	const char *s, *n;
+ 
+-	if (!fdt_chk_extra()) {
++	if (can_assume(VALID_INPUT)) {
+ 		s = (const char *)fdt + fdt_off_dt_strings(fdt) + stroffset;
+ 
+ 		if (lenp)
+@@ -60,7 +60,7 @@ const char *fdt_get_string(const void *fdt, int stroffset, int *lenp)
+ 	if (fdt_magic(fdt) == FDT_MAGIC) {
+ 		if (stroffset < 0)
+ 			goto fail;
+-		if (!fdt_chk_version() || fdt_version(fdt) >= 17) {
++		if (can_assume(LATEST) || fdt_version(fdt) >= 17) {
+ 			if ((unsigned)stroffset >= fdt_size_dt_strings(fdt))
+ 				goto fail;
+ 			if ((fdt_size_dt_strings(fdt) - stroffset) < len)
+@@ -72,7 +72,7 @@ const char *fdt_get_string(const void *fdt, int stroffset, int *lenp)
+ 		if ((stroffset >= 0) ||
+ 		    (sw_stroffset > fdt_size_dt_strings(fdt)))
+ 			goto fail;
+-		if ((sw_stroffset) < len)
++		if (sw_stroffset < len)
+ 			len = sw_stroffset;
+ 	} else {
+ 		err = -FDT_ERR_INTERNAL;
+@@ -162,7 +162,7 @@ static const struct fdt_reserve_entry *fdt_mem_rsv(const void *fdt, int n)
+ 	unsigned int offset = n * sizeof(struct fdt_reserve_entry);
+ 	unsigned int absoffset = fdt_off_mem_rsvmap(fdt) + offset;
+ 
+-	if (fdt_chk_extra()) {
++	if (!can_assume(VALID_INPUT)) {
+ 		if (absoffset < fdt_off_mem_rsvmap(fdt))
+ 			return NULL;
+ 		if (absoffset > fdt_totalsize(fdt) -
+@@ -178,11 +178,11 @@ int fdt_get_mem_rsv(const void *fdt, int n, uint64_t *address, uint64_t *size)
+ 
+ 	FDT_RO_PROBE(fdt);
+ 	re = fdt_mem_rsv(fdt, n);
+-	if (fdt_chk_extra() && !re)
++	if (!can_assume(VALID_INPUT) && !re)
+ 		return -FDT_ERR_BADOFFSET;
+ 
+-	*address = fdt64_to_cpu(re->address);
+-	*size = fdt64_to_cpu(re->size);
++	*address = fdt64_ld_(&re->address);
++	*size = fdt64_ld_(&re->size);
+ 	return 0;
+ }
+ 
+@@ -192,7 +192,7 @@ int fdt_num_mem_rsv(const void *fdt)
+ 	const struct fdt_reserve_entry *re;
+ 
+ 	for (i = 0; (re = fdt_mem_rsv(fdt, i)) != NULL; i++) {
+-		if (fdt64_to_cpu(re->size) == 0)
++		if (fdt64_ld_(&re->size) == 0)
+ 			return i;
+ 	}
+ 	return -FDT_ERR_TRUNCATED;
+@@ -255,6 +255,9 @@ int fdt_path_offset_namelen(const void *fdt, const char *path, int namelen)
+ 
+ 	FDT_RO_PROBE(fdt);
+ 
++	if (!can_assume(VALID_INPUT) && namelen <= 0)
++		return -FDT_ERR_BADPATH;
++
+ 	/* see if we have an alias */
+ 	if (*path != '/') {
+ 		const char *q = memchr(path, '/', end - p);
+@@ -303,14 +306,13 @@ const char *fdt_get_name(const void *fdt, int nodeoffset, int *len)
+ 	const char *nameptr;
+ 	int err;
+ 
+-	if (fdt_chk_extra() &&
+-	    (((err = fdt_ro_probe_(fdt)) < 0)
+-	     || ((err = fdt_check_node_offset_(fdt, nodeoffset)) < 0)))
+-		goto fail;
++	if (((err = fdt_ro_probe_(fdt)) < 0)
++	    || ((err = fdt_check_node_offset_(fdt, nodeoffset)) < 0))
++			goto fail;
+ 
+ 	nameptr = nh->name;
+ 
+-	if (fdt_chk_version() && fdt_version(fdt) < 0x10) {
++	if (!can_assume(LATEST) && fdt_version(fdt) < 0x10) {
+ 		/*
+ 		 * For old FDT versions, match the naming conventions of V16:
+ 		 * give only the leaf name (after all /). The actual tree
+@@ -361,7 +363,8 @@ static const struct fdt_property *fdt_get_property_by_offset_(const void *fdt,
+ 	int err;
+ 	const struct fdt_property *prop;
+ 
+-	if (fdt_chk_basic() && (err = fdt_check_prop_offset_(fdt, offset)) < 0) {
++	if (!can_assume(VALID_INPUT) &&
++	    (err = fdt_check_prop_offset_(fdt, offset)) < 0) {
+ 		if (lenp)
+ 			*lenp = err;
+ 		return NULL;
+@@ -370,7 +373,7 @@ static const struct fdt_property *fdt_get_property_by_offset_(const void *fdt,
+ 	prop = fdt_offset_ptr_(fdt, offset);
+ 
+ 	if (lenp)
+-		*lenp = fdt32_to_cpu(prop->len);
++		*lenp = fdt32_ld_(&prop->len);
+ 
+ 	return prop;
+ }
+@@ -382,7 +385,7 @@ const struct fdt_property *fdt_get_property_by_offset(const void *fdt,
+ 	/* Prior to version 16, properties may need realignment
+ 	 * and this API does not work. fdt_getprop_*() will, however. */
+ 
+-	if (fdt_chk_version() && fdt_version(fdt) < 0x10) {
++	if (!can_assume(LATEST) && fdt_version(fdt) < 0x10) {
+ 		if (lenp)
+ 			*lenp = -FDT_ERR_BADVERSION;
+ 		return NULL;
+@@ -404,11 +407,11 @@ static const struct fdt_property *fdt_get_property_namelen_(const void *fdt,
+ 		const struct fdt_property *prop;
+ 
+ 		prop = fdt_get_property_by_offset_(fdt, offset, lenp);
+-		if (fdt_chk_extra() && !prop) {
++		if (!can_assume(LIBFDT_FLAWLESS) && !prop) {
+ 			offset = -FDT_ERR_INTERNAL;
+ 			break;
+ 		}
+-		if (fdt_string_eq_(fdt, fdt32_to_cpu(prop->nameoff),
++		if (fdt_string_eq_(fdt, fdt32_ld_(&prop->nameoff),
+ 				   name, namelen)) {
+ 			if (poffset)
+ 				*poffset = offset;
+@@ -428,7 +431,7 @@ const struct fdt_property *fdt_get_property_namelen(const void *fdt,
+ {
+ 	/* Prior to version 16, properties may need realignment
+ 	 * and this API does not work. fdt_getprop_*() will, however. */
+-	if (fdt_chk_version() && fdt_version(fdt) < 0x10) {
++	if (!can_assume(LATEST) && fdt_version(fdt) < 0x10) {
+ 		if (lenp)
+ 			*lenp = -FDT_ERR_BADVERSION;
+ 		return NULL;
+@@ -458,8 +461,8 @@ const void *fdt_getprop_namelen(const void *fdt, int nodeoffset,
+ 		return NULL;
+ 
+ 	/* Handle realignment */
+-	if (fdt_chk_version() && fdt_version(fdt) < 0x10 &&
+-	    (poffset + sizeof(*prop)) % 8 && fdt32_to_cpu(prop->len) >= 8)
++	if (!can_assume(LATEST) && fdt_version(fdt) < 0x10 &&
++	    (poffset + sizeof(*prop)) % 8 && fdt32_ld_(&prop->len) >= 8)
+ 		return prop->data + 4;
+ 	return prop->data;
+ }
+@@ -476,23 +479,23 @@ const void *fdt_getprop_by_offset(const void *fdt, int offset,
+ 		const char *name;
+ 		int namelen;
+ 
+-		if (fdt_chk_extra()) {
+-			name = fdt_get_string(fdt, fdt32_to_cpu(prop->nameoff),
++		if (!can_assume(VALID_INPUT)) {
++			name = fdt_get_string(fdt, fdt32_ld_(&prop->nameoff),
+ 					      &namelen);
++			*namep = name;
+ 			if (!name) {
+ 				if (lenp)
+ 					*lenp = namelen;
+ 				return NULL;
+ 			}
+-			*namep = name;
+ 		} else {
+-			*namep = fdt_string(fdt, fdt32_to_cpu(prop->nameoff));
++			*namep = fdt_string(fdt, fdt32_ld_(&prop->nameoff));
+ 		}
+ 	}
+ 
+ 	/* Handle realignment */
+-	if (fdt_chk_version() && fdt_version(fdt) < 0x10 &&
+-	    (offset + sizeof(*prop)) % 8 && fdt32_to_cpu(prop->len) >= 8)
++	if (!can_assume(LATEST) && fdt_version(fdt) < 0x10 &&
++	    (offset + sizeof(*prop)) % 8 && fdt32_ld_(&prop->len) >= 8)
+ 		return prop->data + 4;
+ 	return prop->data;
+ }
+@@ -517,19 +520,34 @@ uint32_t fdt_get_phandle(const void *fdt, int nodeoffset)
+ 			return 0;
+ 	}
+ 
+-	return fdt32_to_cpu(*php);
++	return fdt32_ld_(php);
++}
++
++static const void *fdt_path_getprop_namelen(const void *fdt, const char *path,
++					    const char *propname, int propnamelen,
++					    int *lenp)
++{
++	int offset = fdt_path_offset(fdt, path);
++
++	if (offset < 0)
++		return NULL;
++
++	return fdt_getprop_namelen(fdt, offset, propname, propnamelen, lenp);
+ }
+ 
+ const char *fdt_get_alias_namelen(const void *fdt,
+ 				  const char *name, int namelen)
+ {
+-	int aliasoffset;
++	int len;
++	const char *alias;
++
++	alias = fdt_path_getprop_namelen(fdt, "/aliases", name, namelen, &len);
+ 
+-	aliasoffset = fdt_path_offset(fdt, "/aliases");
+-	if (aliasoffset < 0)
++	if (!can_assume(VALID_DTB) &&
++	    !(alias && len > 0 && alias[len - 1] == '\0' && *alias == '/'))
+ 		return NULL;
+ 
+-	return fdt_getprop_namelen(fdt, aliasoffset, name, namelen, NULL);
++	return alias;
+ }
+ 
+ const char *fdt_get_alias(const void *fdt, const char *name)
+@@ -537,6 +555,17 @@ const char *fdt_get_alias(const void *fdt, const char *name)
+ 	return fdt_get_alias_namelen(fdt, name, strlen(name));
+ }
+ 
++const char *fdt_get_symbol_namelen(const void *fdt,
++				   const char *name, int namelen)
++{
++	return fdt_path_getprop_namelen(fdt, "/__symbols__", name, namelen, NULL);
++}
++
++const char *fdt_get_symbol(const void *fdt, const char *name)
++{
++	return fdt_get_symbol_namelen(fdt, name, strlen(name));
++}
++
+ int fdt_get_path(const void *fdt, int nodeoffset, char *buf, int buflen)
+ {
+ 	int pdepth = 0, p = 0;
+@@ -617,7 +646,7 @@ int fdt_supernode_atdepth_offset(const void *fdt, int nodeoffset,
+ 		}
+ 	}
+ 
+-	if (fdt_chk_extra()) {
++	if (!can_assume(VALID_INPUT)) {
+ 		if ((offset == -FDT_ERR_NOTFOUND) || (offset >= 0))
+ 			return -FDT_ERR_BADOFFSET;
+ 		else if (offset == -FDT_ERR_BADOFFSET)
+@@ -634,7 +663,8 @@ int fdt_node_depth(const void *fdt, int nodeoffset)
+ 
+ 	err = fdt_supernode_atdepth_offset(fdt, nodeoffset, 0, &nodedepth);
+ 	if (err)
+-		return (!fdt_chk_extra() || err < 0) ? err : -FDT_ERR_INTERNAL;
++		return (can_assume(LIBFDT_FLAWLESS) || err < 0) ? err :
++			-FDT_ERR_INTERNAL;
+ 	return nodedepth;
+ }
+ 
+diff --git a/scripts/dtc/libfdt/fdt_rw.c b/scripts/dtc/libfdt/fdt_rw.c
+index 2eb2b38703b..7475cafce07 100644
+--- a/scripts/dtc/libfdt/fdt_rw.c
++++ b/scripts/dtc/libfdt/fdt_rw.c
+@@ -13,8 +13,6 @@
+ static int fdt_blocks_misordered_(const void *fdt,
+ 				  int mem_rsv_size, int struct_size)
+ {
+-	if (!fdt_chk_basic())
+-		return false;
+ 	return (fdt_off_mem_rsvmap(fdt) < FDT_ALIGN(sizeof(struct fdt_header), 8))
+ 		|| (fdt_off_dt_struct(fdt) <
+ 		    (fdt_off_mem_rsvmap(fdt) + mem_rsv_size))
+@@ -26,16 +24,16 @@ static int fdt_blocks_misordered_(const void *fdt,
+ 
+ static int fdt_rw_probe_(void *fdt)
+ {
+-	if (!fdt_chk_basic())
++	if (can_assume(VALID_DTB))
+ 		return 0;
+ 	FDT_RO_PROBE(fdt);
+ 
+-	if (fdt_chk_version() && fdt_version(fdt) < 17)
++	if (!can_assume(LATEST) && fdt_version(fdt) < 17)
+ 		return -FDT_ERR_BADVERSION;
+ 	if (fdt_blocks_misordered_(fdt, sizeof(struct fdt_reserve_entry),
+ 				   fdt_size_dt_struct(fdt)))
+ 		return -FDT_ERR_BADLAYOUT;
+-	if (fdt_chk_version() && fdt_version(fdt) > 17)
++	if (!can_assume(LATEST) && fdt_version(fdt) > 17)
+ 		fdt_set_version(fdt, 17);
+ 
+ 	return 0;
+@@ -44,11 +42,11 @@ static int fdt_rw_probe_(void *fdt)
+ #define FDT_RW_PROBE(fdt) \
+ 	{ \
+ 		int err_; \
+-		if (fdt_chk_extra() && (err_ = fdt_rw_probe_(fdt)) != 0) \
++		if ((err_ = fdt_rw_probe_(fdt)) != 0) \
+ 			return err_; \
+ 	}
+ 
+-static inline int fdt_data_size_(void *fdt)
++static inline unsigned int fdt_data_size_(void *fdt)
+ {
+ 	return fdt_off_dt_strings(fdt) + fdt_size_dt_strings(fdt);
+ }
+@@ -56,15 +54,16 @@ static inline int fdt_data_size_(void *fdt)
+ static int fdt_splice_(void *fdt, void *splicepoint, int oldlen, int newlen)
+ {
+ 	char *p = splicepoint;
+-	char *end = (char *)fdt + fdt_data_size_(fdt);
++	unsigned int dsize = fdt_data_size_(fdt);
++	size_t soff = p - (char *)fdt;
+ 
+-	if (((p + oldlen) < p) || ((p + oldlen) > end))
++	if ((oldlen < 0) || (soff + oldlen < soff) || (soff + oldlen > dsize))
+ 		return -FDT_ERR_BADOFFSET;
+-	if ((p < (char *)fdt) || ((end - oldlen + newlen) < (char *)fdt))
++	if ((p < (char *)fdt) || (dsize + newlen < (unsigned)oldlen))
+ 		return -FDT_ERR_BADOFFSET;
+-	if ((end - oldlen + newlen) > ((char *)fdt + fdt_totalsize(fdt)))
++	if (dsize - oldlen + newlen > fdt_totalsize(fdt))
+ 		return -FDT_ERR_NOSPACE;
+-	memmove(p + newlen, p + oldlen, end - p - oldlen);
++	memmove(p + newlen, p + oldlen, ((char *)fdt + dsize) - (p + oldlen));
+ 	return 0;
+ }
+ 
+@@ -122,34 +121,36 @@ static int fdt_splice_string_(void *fdt, int newlen)
+  * @fdt: pointer to the device tree to check/adjust
+  * @s: string to find/add
+  * @allocated: Set to 0 if the string was found, 1 if not found and so
+- *	allocated. Ignored if !fdt_chk_basic()
+- * Return: offset of string in the string table (whether found or added)
++ *	allocated. Ignored if can_assume(NO_ROLLBACK)
++ * @return offset of string in the string table (whether found or added)
+  */
+-static int fdt_find_add_string_(void *fdt, const char *s, int *allocated)
++static int fdt_find_add_string_(void *fdt, const char *s, int slen,
++				int *allocated)
+ {
+ 	char *strtab = (char *)fdt + fdt_off_dt_strings(fdt);
+ 	const char *p;
+ 	char *new;
+-	int len = strlen(s) + 1;
+ 	int err;
+ 
+-	if (fdt_chk_basic())
++	if (!can_assume(NO_ROLLBACK))
+ 		*allocated = 0;
+ 
+-	p = fdt_find_string_(strtab, fdt_size_dt_strings(fdt), s);
++	p = fdt_find_string_len_(strtab, fdt_size_dt_strings(fdt), s, slen);
+ 	if (p)
+ 		/* found it */
+ 		return (p - strtab);
+ 
+ 	new = strtab + fdt_size_dt_strings(fdt);
+-	err = fdt_splice_string_(fdt, len);
++	err = fdt_splice_string_(fdt, slen + 1);
+ 	if (err)
+ 		return err;
+ 
+-	if (fdt_chk_basic())
++	if (!can_assume(NO_ROLLBACK))
+ 		*allocated = 1;
+ 
+-	memcpy(new, s, len);
++	memcpy(new, s, slen);
++	new[slen] = '\0';
++
+ 	return (new - strtab);
+ }
+ 
+@@ -182,13 +183,15 @@ int fdt_del_mem_rsv(void *fdt, int n)
+ 	return fdt_splice_mem_rsv_(fdt, re, 1, 0);
+ }
+ 
+-static int fdt_resize_property_(void *fdt, int nodeoffset, const char *name,
++static int fdt_resize_property_(void *fdt, int nodeoffset,
++				const char *name, int namelen,
+ 				int len, struct fdt_property **prop)
+ {
+ 	int oldlen;
+ 	int err;
+ 
+-	*prop = fdt_get_property_w(fdt, nodeoffset, name, &oldlen);
++	*prop = fdt_get_property_namelen_w(fdt, nodeoffset, name, namelen,
++					   &oldlen);
+ 	if (!*prop)
+ 		return oldlen;
+ 
+@@ -201,7 +204,7 @@ static int fdt_resize_property_(void *fdt, int nodeoffset, const char *name,
+ }
+ 
+ static int fdt_add_property_(void *fdt, int nodeoffset, const char *name,
+-			     int len, struct fdt_property **prop)
++			     int namelen, int len, struct fdt_property **prop)
+ {
+ 	int proplen;
+ 	int nextoffset;
+@@ -212,7 +215,7 @@ static int fdt_add_property_(void *fdt, int nodeoffset, const char *name,
+ 	if ((nextoffset = fdt_check_node_offset_(fdt, nodeoffset)) < 0)
+ 		return nextoffset;
+ 
+-	namestroff = fdt_find_add_string_(fdt, name, &allocated);
++	namestroff = fdt_find_add_string_(fdt, name, namelen, &allocated);
+ 	if (namestroff < 0)
+ 		return namestroff;
+ 
+@@ -222,7 +225,7 @@ static int fdt_add_property_(void *fdt, int nodeoffset, const char *name,
+ 	err = fdt_splice_struct_(fdt, *prop, 0, proplen);
+ 	if (err) {
+ 		/* Delete the string if we failed to add it */
+-		if (fdt_chk_basic() && allocated)
++		if (!can_assume(NO_ROLLBACK) && allocated)
+ 			fdt_del_last_string_(fdt, name);
+ 		return err;
+ 	}
+@@ -256,17 +259,18 @@ int fdt_set_name(void *fdt, int nodeoffset, const char *name)
+ 	return 0;
+ }
+ 
+-int fdt_setprop_placeholder(void *fdt, int nodeoffset, const char *name,
+-			    int len, void **prop_data)
++int fdt_setprop_placeholder_namelen(void *fdt, int nodeoffset, const char *name,
++				    int namelen, int len, void **prop_data)
+ {
+ 	struct fdt_property *prop;
+ 	int err;
+ 
+ 	FDT_RW_PROBE(fdt);
+ 
+-	err = fdt_resize_property_(fdt, nodeoffset, name, len, &prop);
++	err = fdt_resize_property_(fdt, nodeoffset, name, namelen, len, &prop);
+ 	if (err == -FDT_ERR_NOTFOUND)
+-		err = fdt_add_property_(fdt, nodeoffset, name, len, &prop);
++		err = fdt_add_property_(fdt, nodeoffset, name, namelen, len,
++					&prop);
+ 	if (err)
+ 		return err;
+ 
+@@ -274,13 +278,14 @@ int fdt_setprop_placeholder(void *fdt, int nodeoffset, const char *name,
+ 	return 0;
+ }
+ 
+-int fdt_setprop(void *fdt, int nodeoffset, const char *name,
+-		const void *val, int len)
++int fdt_setprop_namelen(void *fdt, int nodeoffset, const char *name,
++			int namelen, const void *val, int len)
+ {
+ 	void *prop_data;
+ 	int err;
+ 
+-	err = fdt_setprop_placeholder(fdt, nodeoffset, name, len, &prop_data);
++	err = fdt_setprop_placeholder_namelen(fdt, nodeoffset, name, namelen,
++					      len, &prop_data);
+ 	if (err)
+ 		return err;
+ 
+@@ -308,7 +313,8 @@ int fdt_appendprop(void *fdt, int nodeoffset, const char *name,
+ 		prop->len = cpu_to_fdt32(newlen);
+ 		memcpy(prop->data + oldlen, val, len);
+ 	} else {
+-		err = fdt_add_property_(fdt, nodeoffset, name, len, &prop);
++		err = fdt_add_property_(fdt, nodeoffset, name, strlen(name),
++					len, &prop);
+ 		if (err)
+ 			return err;
+ 		memcpy(prop->data, val, len);
+@@ -350,7 +356,10 @@ int fdt_add_subnode_namelen(void *fdt, int parentoffset,
+ 		return offset;
+ 
+ 	/* Try to place the new node after the parent's properties */
+-	fdt_next_tag(fdt, parentoffset, &nextoffset); /* skip the BEGIN_NODE */
++	tag = fdt_next_tag(fdt, parentoffset, &nextoffset);
++	/* the fdt_subnode_offset_namelen() should ensure this never hits */
++	if (!can_assume(LIBFDT_FLAWLESS) && (tag != FDT_BEGIN_NODE))
++		return -FDT_ERR_INTERNAL;
+ 	do {
+ 		offset = nextoffset;
+ 		tag = fdt_next_tag(fdt, offset, &nextoffset);
+@@ -392,7 +401,9 @@ int fdt_del_node(void *fdt, int nodeoffset)
+ }
+ 
+ static void fdt_packblocks_(const char *old, char *new,
+-			    int mem_rsv_size, int struct_size)
++			    int mem_rsv_size,
++			    int struct_size,
++			    int strings_size)
+ {
+ 	int mem_rsv_off, struct_off, strings_off;
+ 
+@@ -407,8 +418,7 @@ static void fdt_packblocks_(const char *old, char *new,
+ 	fdt_set_off_dt_struct(new, struct_off);
+ 	fdt_set_size_dt_struct(new, struct_size);
+ 
+-	memmove(new + strings_off, old + fdt_off_dt_strings(old),
+-		fdt_size_dt_strings(old));
++	memmove(new + strings_off, old + fdt_off_dt_strings(old), strings_size);
+ 	fdt_set_off_dt_strings(new, strings_off);
+ 	fdt_set_size_dt_strings(new, fdt_size_dt_strings(old));
+ }
+@@ -427,17 +437,20 @@ int fdt_open_into(const void *fdt, void *buf, int bufsize)
+ 	mem_rsv_size = (fdt_num_mem_rsv(fdt)+1)
+ 		* sizeof(struct fdt_reserve_entry);
+ 
+-	if (!fdt_chk_version() || fdt_version(fdt) >= 17) {
++	if (can_assume(LATEST) || fdt_version(fdt) >= 17) {
+ 		struct_size = fdt_size_dt_struct(fdt);
+-	} else {
++	} else if (fdt_version(fdt) == 16) {
+ 		struct_size = 0;
+ 		while (fdt_next_tag(fdt, struct_size, &struct_size) != FDT_END)
+ 			;
+ 		if (struct_size < 0)
+ 			return struct_size;
++	} else {
++		return -FDT_ERR_BADVERSION;
+ 	}
+ 
+-	if (!fdt_blocks_misordered_(fdt, mem_rsv_size, struct_size)) {
++	if (can_assume(LIBFDT_ORDER) ||
++	    !fdt_blocks_misordered_(fdt, mem_rsv_size, struct_size)) {
+ 		/* no further work necessary */
+ 		err = fdt_move(fdt, buf, bufsize);
+ 		if (err)
+@@ -465,7 +478,8 @@ int fdt_open_into(const void *fdt, void *buf, int bufsize)
+ 			return -FDT_ERR_NOSPACE;
+ 	}
+ 
+-	fdt_packblocks_(fdt, tmp, mem_rsv_size, struct_size);
++	fdt_packblocks_(fdt, tmp, mem_rsv_size, struct_size,
++			fdt_size_dt_strings(fdt));
+ 	memmove(buf, tmp, newsize);
+ 
+ 	fdt_set_magic(buf, FDT_MAGIC);
+@@ -485,7 +499,8 @@ int fdt_pack(void *fdt)
+ 
+ 	mem_rsv_size = (fdt_num_mem_rsv(fdt)+1)
+ 		* sizeof(struct fdt_reserve_entry);
+-	fdt_packblocks_(fdt, fdt, mem_rsv_size, fdt_size_dt_struct(fdt));
++	fdt_packblocks_(fdt, fdt, mem_rsv_size, fdt_size_dt_struct(fdt),
++			fdt_size_dt_strings(fdt));
+ 	fdt_set_totalsize(fdt, fdt_data_size_(fdt));
+ 
+ 	return 0;
+diff --git a/scripts/dtc/libfdt/fdt_strerror.c b/scripts/dtc/libfdt/fdt_strerror.c
+index b4356931b06..d852b77e81e 100644
+--- a/scripts/dtc/libfdt/fdt_strerror.c
++++ b/scripts/dtc/libfdt/fdt_strerror.c
+@@ -39,6 +39,7 @@ static struct fdt_errtabent fdt_errtable[] = {
+ 	FDT_ERRTABENT(FDT_ERR_BADOVERLAY),
+ 	FDT_ERRTABENT(FDT_ERR_NOPHANDLES),
+ 	FDT_ERRTABENT(FDT_ERR_BADFLAGS),
++	FDT_ERRTABENT(FDT_ERR_ALIGNMENT),
+ };
+ #define FDT_ERRTABSIZE	((int)(sizeof(fdt_errtable) / sizeof(fdt_errtable[0])))
+ 
+diff --git a/scripts/dtc/libfdt/fdt_sw.c b/scripts/dtc/libfdt/fdt_sw.c
+index d9e67fa2a61..4c569ee7eb0 100644
+--- a/scripts/dtc/libfdt/fdt_sw.c
++++ b/scripts/dtc/libfdt/fdt_sw.c
+@@ -12,7 +12,7 @@
+ 
+ static int fdt_sw_probe_(void *fdt)
+ {
+-	if (fdt_chk_basic()) {
++	if (!can_assume(VALID_INPUT)) {
+ 		if (fdt_magic(fdt) == FDT_MAGIC)
+ 			return -FDT_ERR_BADSTATE;
+ 		else if (fdt_magic(fdt) != FDT_SW_MAGIC)
+@@ -25,14 +25,14 @@ static int fdt_sw_probe_(void *fdt)
+ #define FDT_SW_PROBE(fdt) \
+ 	{ \
+ 		int err; \
+-		if (fdt_chk_basic() && (err = fdt_sw_probe_(fdt)) != 0) \
++		if ((err = fdt_sw_probe_(fdt)) != 0) \
+ 			return err; \
+ 	}
+ 
+ /* 'memrsv' state:	Initial state after fdt_create()
+  *
+  * Allowed functions:
+- *	fdt_add_reservmap_entry()
++ *	fdt_add_reservemap_entry()
+  *	fdt_finish_reservemap()		[moves to 'struct' state]
+  */
+ static int fdt_sw_probe_memrsv_(void *fdt)
+@@ -41,7 +41,7 @@ static int fdt_sw_probe_memrsv_(void *fdt)
+ 	if (err)
+ 		return err;
+ 
+-	if (fdt_chk_extra() && fdt_off_dt_strings(fdt) != 0)
++	if (!can_assume(VALID_INPUT) && fdt_off_dt_strings(fdt) != 0)
+ 		return -FDT_ERR_BADSTATE;
+ 	return 0;
+ }
+@@ -49,7 +49,7 @@ static int fdt_sw_probe_memrsv_(void *fdt)
+ #define FDT_SW_PROBE_MEMRSV(fdt) \
+ 	{ \
+ 		int err; \
+-		if (fdt_chk_extra() && (err = fdt_sw_probe_memrsv_(fdt)) != 0) \
++		if ((err = fdt_sw_probe_memrsv_(fdt)) != 0) \
+ 			return err; \
+ 	}
+ 
+@@ -63,15 +63,12 @@ static int fdt_sw_probe_memrsv_(void *fdt)
+  */
+ static int fdt_sw_probe_struct_(void *fdt)
+ {
+-	int err;
+-
+-	if (!fdt_chk_extra())
+-		return 0;
+-	err = fdt_sw_probe_(fdt);
++	int err = fdt_sw_probe_(fdt);
+ 	if (err)
+ 		return err;
+ 
+-	if (fdt_off_dt_strings(fdt) != fdt_totalsize(fdt))
++	if (!can_assume(VALID_INPUT) &&
++	    fdt_off_dt_strings(fdt) != fdt_totalsize(fdt))
+ 		return -FDT_ERR_BADSTATE;
+ 	return 0;
+ }
+@@ -79,7 +76,7 @@ static int fdt_sw_probe_struct_(void *fdt)
+ #define FDT_SW_PROBE_STRUCT(fdt) \
+ 	{ \
+ 		int err; \
+-		if (fdt_chk_extra() && (err = fdt_sw_probe_struct_(fdt)) != 0) \
++		if ((err = fdt_sw_probe_struct_(fdt)) != 0) \
+ 			return err; \
+ 	}
+ 
+@@ -161,7 +158,8 @@ int fdt_resize(void *fdt, void *buf, int bufsize)
+ 	headsize = fdt_off_dt_struct(fdt) + fdt_size_dt_struct(fdt);
+ 	tailsize = fdt_size_dt_strings(fdt);
+ 
+-	if (fdt_chk_extra() && (headsize + tailsize) > fdt_totalsize(fdt))
++	if (!can_assume(VALID_DTB) &&
++	    headsize + tailsize > fdt_totalsize(fdt))
+ 		return -FDT_ERR_INTERNAL;
+ 
+ 	if ((headsize + tailsize) > (unsigned)bufsize)
+@@ -379,7 +377,7 @@ int fdt_finish(void *fdt)
+ 	fdt_set_totalsize(fdt, newstroffset + fdt_size_dt_strings(fdt));
+ 
+ 	/* And fix up fields that were keeping intermediate state. */
+-	fdt_set_last_comp_version(fdt, FDT_FIRST_SUPPORTED_VERSION);
++	fdt_set_last_comp_version(fdt, FDT_LAST_COMPATIBLE_VERSION);
+ 	fdt_set_magic(fdt, FDT_MAGIC);
+ 
+ 	return 0;
+diff --git a/scripts/dtc/libfdt/libfdt.h b/scripts/dtc/libfdt/libfdt.h
+index 16ec53e78b8..7f8bb05c545 100644
+--- a/scripts/dtc/libfdt/libfdt.h
++++ b/scripts/dtc/libfdt/libfdt.h
+@@ -9,7 +9,12 @@
+ #include "libfdt_env.h"
+ #include "fdt.h"
+ 
++#ifdef __cplusplus
++extern "C" {
++#endif
++
+ #define FDT_FIRST_SUPPORTED_VERSION	0x02
++#define FDT_LAST_COMPATIBLE_VERSION	0x10
+ #define FDT_LAST_SUPPORTED_VERSION	0x11
+ 
+ /* Error codes: informative error codes */
+@@ -97,7 +102,11 @@
+ 	/* FDT_ERR_BADFLAGS: The function was passed a flags field that
+ 	 * contains invalid flags or an invalid combination of flags. */
+ 
+-#define FDT_ERR_MAX		18
++#define FDT_ERR_ALIGNMENT	19
++	/* FDT_ERR_ALIGNMENT: The device tree base address is not 8-byte
++	 * aligned. */
++
++#define FDT_ERR_MAX		19
+ 
+ /* constants */
+ #define FDT_MAX_PHANDLE 0xfffffffe
+@@ -117,6 +126,23 @@ static inline void *fdt_offset_ptr_w(void *fdt, int offset, int checklen)
+ 
+ uint32_t fdt_next_tag(const void *fdt, int offset, int *nextoffset);
+ 
++/*
++ * External helpers to access words from a device tree blob. They're built
++ * to work even with unaligned pointers on platforms (such as ARMv5) that don't
++ * like unaligned loads and stores.
++ */
++static inline uint16_t fdt16_ld(const fdt16_t *p)
++{
++	const uint8_t *bp = (const uint8_t *)p;
++
++	return ((uint16_t)bp[0] << 8) | bp[1];
++}
++
++static inline uint32_t fdt32_ld(const fdt32_t *p)
++{
++	return fdt32_to_cpu(*p);
++}
++
+ static inline void fdt32_st(void *property, uint32_t value)
+ {
+ 	uint8_t *bp = (uint8_t *)property;
+@@ -127,6 +153,11 @@ static inline void fdt32_st(void *property, uint32_t value)
+ 	bp[3] = value & 0xff;
+ }
+ 
++static inline uint64_t fdt64_ld(const fdt64_t *p)
++{
++	return fdt64_to_cpu(*p);
++}
++
+ static inline void fdt64_st(void *property, uint64_t value)
+ {
+ 	uint8_t *bp = (uint8_t *)property;
+@@ -149,23 +180,23 @@ int fdt_next_node(const void *fdt, int offset, int *depth);
+ 
+ /**
+  * fdt_first_subnode() - get offset of first direct subnode
+- *
+  * @fdt:	FDT blob
+  * @offset:	Offset of node to check
++ *
+  * Return: offset of first subnode, or -FDT_ERR_NOTFOUND if there is none
+  */
+ int fdt_first_subnode(const void *fdt, int offset);
+ 
+ /**
+  * fdt_next_subnode() - get offset of next direct subnode
++ * @fdt:	FDT blob
++ * @offset:	Offset of previous subnode
+  *
+  * After first calling fdt_first_subnode(), call this function repeatedly to
+  * get direct subnodes of a parent node.
+  *
+- * @fdt:	FDT blob
+- * @offset:	Offset of previous subnode
+  * Return: offset of next subnode, or -FDT_ERR_NOTFOUND if there are no more
+- * subnodes
++ *         subnodes
+  */
+ int fdt_next_subnode(const void *fdt, int offset);
+ 
+@@ -190,7 +221,6 @@ int fdt_next_subnode(const void *fdt, int offset);
+  * Note that this is implemented as a macro and @node is used as
+  * iterator in the loop. The parent variable be constant or even a
+  * literal.
+- *
+  */
+ #define fdt_for_each_subnode(node, fdt, parent)		\
+ 	for (node = fdt_first_subnode(fdt, parent);	\
+@@ -201,7 +231,7 @@ int fdt_next_subnode(const void *fdt, int offset);
+ /* General functions                                                  */
+ /**********************************************************************/
+ #define fdt_get_header(fdt, field) \
+-	(fdt32_to_cpu(((const struct fdt_header *)(fdt))->field))
++	(fdt32_ld(&((const struct fdt_header *)(fdt))->field))
+ #define fdt_magic(fdt)			(fdt_get_header(fdt, magic))
+ #define fdt_totalsize(fdt)		(fdt_get_header(fdt, totalsize))
+ #define fdt_off_dt_struct(fdt)		(fdt_get_header(fdt, off_dt_struct))
+@@ -219,32 +249,36 @@ int fdt_next_subnode(const void *fdt, int offset);
+ 		struct fdt_header *fdth = (struct fdt_header *)fdt; \
+ 		fdth->name = cpu_to_fdt32(val); \
+ 	}
+-fdt_set_hdr_(magic);
+-fdt_set_hdr_(totalsize);
+-fdt_set_hdr_(off_dt_struct);
+-fdt_set_hdr_(off_dt_strings);
+-fdt_set_hdr_(off_mem_rsvmap);
+-fdt_set_hdr_(version);
+-fdt_set_hdr_(last_comp_version);
+-fdt_set_hdr_(boot_cpuid_phys);
+-fdt_set_hdr_(size_dt_strings);
+-fdt_set_hdr_(size_dt_struct);
++fdt_set_hdr_(magic)
++fdt_set_hdr_(totalsize)
++fdt_set_hdr_(off_dt_struct)
++fdt_set_hdr_(off_dt_strings)
++fdt_set_hdr_(off_mem_rsvmap)
++fdt_set_hdr_(version)
++fdt_set_hdr_(last_comp_version)
++fdt_set_hdr_(boot_cpuid_phys)
++fdt_set_hdr_(size_dt_strings)
++fdt_set_hdr_(size_dt_struct)
+ #undef fdt_set_hdr_
+ 
+ /**
+  * fdt_header_size - return the size of the tree's header
+  * @fdt: pointer to a flattened device tree
++ *
++ * Return: size of DTB header in bytes
+  */
+ size_t fdt_header_size(const void *fdt);
+ 
+ /**
+- * fdt_header_size_ - internal function which takes a version number
++ * fdt_header_size_ - internal function to get header size from a version number
++ * @version: device tree version number
++ *
++ * Return: size of DTB header in bytes
+  */
+ size_t fdt_header_size_(uint32_t version);
+ 
+ /**
+  * fdt_check_header - sanity check a device tree header
+-
+  * @fdt: pointer to data which might be a flattened device tree
+  *
+  * fdt_check_header() checks that the given buffer contains what
+@@ -369,8 +403,7 @@ static inline uint32_t fdt_get_max_phandle(const void *fdt)
+  * highest phandle value in the device tree blob) will be returned in the
+  * @phandle parameter.
+  *
+- * Returns:
+- *   0 on success or a negative error-code on failure
++ * Return: 0 on success or a negative error-code on failure
+  */
+ int fdt_generate_phandle(const void *fdt, uint32_t *phandle);
+ 
+@@ -390,9 +423,11 @@ int fdt_num_mem_rsv(const void *fdt);
+ /**
+  * fdt_get_mem_rsv - retrieve one memory reserve map entry
+  * @fdt: pointer to the device tree blob
+- * @address, @size: pointers to 64-bit variables
++ * @n: index of reserve map entry
++ * @address: pointer to 64-bit variable to hold the start address
++ * @size: pointer to 64-bit variable to hold the size of the entry
+  *
+- * On success, *address and *size will contain the address and size of
++ * On success, @address and @size will contain the address and size of
+  * the n-th reserve map entry from the device tree blob, in
+  * native-endian format.
+  *
+@@ -415,6 +450,8 @@ int fdt_get_mem_rsv(const void *fdt, int n, uint64_t *address, uint64_t *size);
+  * namelen characters of name for matching the subnode name.  This is
+  * useful for finding subnodes based on a portion of a larger string,
+  * such as a full path.
++ *
++ * Return: offset of the subnode or -FDT_ERR_NOTFOUND if name not found.
+  */
+ #ifndef SWIG /* Not available in Python */
+ int fdt_subnode_offset_namelen(const void *fdt, int parentoffset,
+@@ -454,6 +491,8 @@ int fdt_subnode_offset(const void *fdt, int parentoffset, const char *name);
+  *
+  * Identical to fdt_path_offset(), but only consider the first namelen
+  * characters of path as the path name.
++ *
++ * Return: offset of the node or negative libfdt error value otherwise
+  */
+ #ifndef SWIG /* Not available in Python */
+ int fdt_path_offset_namelen(const void *fdt, const char *path, int namelen);
+@@ -471,12 +510,37 @@ int fdt_path_offset_namelen(const void *fdt, const char *path, int namelen);
+  * level matching the given component, differentiated only by unit
+  * address).
+  *
++ * If the path is not absolute (i.e. does not begin with '/'), the
++ * first component is treated as an alias.  That is, the property by
++ * that name is looked up in the /aliases node, and the value of that
++ * property used in place of that first component.
++ *
++ * For example, for this small fragment
++ *
++ * / {
++ *     aliases {
++ *         i2c2 = &foo; // RHS compiles to "/soc@0/i2c@30a40000/eeprom@52"
++ *     };
++ *     soc@0 {
++ *         foo: i2c@30a40000 {
++ *             bar: eeprom@52 {
++ *             };
++ *         };
++ *     };
++ * };
++ *
++ * these would be equivalent:
++ *
++ *   /soc@0/i2c@30a40000/eeprom@52
++ *   i2c2/eeprom@52
++ *
+  * returns:
+  *	structure block offset of the node with the requested path (>=0), on
+  *		success
+- *	-FDT_ERR_BADPATH, given path does not begin with '/' or is invalid
++ *	-FDT_ERR_BADPATH, given path does not begin with '/' and the first
++ *		component is not a valid alias
+  *	-FDT_ERR_NOTFOUND, if the requested node does not exist
+- *      -FDT_ERR_BADMAGIC,
++ *	-FDT_ERR_BADMAGIC,
+  *	-FDT_ERR_BADVERSION,
+  *	-FDT_ERR_BADSTATE,
+  *	-FDT_ERR_BADSTRUCTURE,
+@@ -521,7 +585,7 @@ const char *fdt_get_name(const void *fdt, int nodeoffset, int *lenp);
+  *	structure block offset of the property (>=0), on success
+  *	-FDT_ERR_NOTFOUND, if the requested node has no properties
+  *	-FDT_ERR_BADOFFSET, if nodeoffset did not point to an FDT_BEGIN_NODE tag
+- *      -FDT_ERR_BADMAGIC,
++ *	-FDT_ERR_BADMAGIC,
+  *	-FDT_ERR_BADVERSION,
+  *	-FDT_ERR_BADSTATE,
+  *	-FDT_ERR_BADSTRUCTURE,
+@@ -542,7 +606,7 @@ int fdt_first_property_offset(const void *fdt, int nodeoffset);
+  *	structure block offset of the next property (>=0), on success
+  *	-FDT_ERR_NOTFOUND, if the given property is the last in its node
+  *	-FDT_ERR_BADOFFSET, if nodeoffset did not point to an FDT_PROP tag
+- *      -FDT_ERR_BADMAGIC,
++ *	-FDT_ERR_BADMAGIC,
+  *	-FDT_ERR_BADVERSION,
+  *	-FDT_ERR_BADSTATE,
+  *	-FDT_ERR_BADSTRUCTURE,
+@@ -553,9 +617,9 @@ int fdt_next_property_offset(const void *fdt, int offset);
+ /**
+  * fdt_for_each_property_offset - iterate over all properties of a node
+  *
+- * @property_offset:	property offset (int, lvalue)
+- * @fdt:		FDT blob (const void *)
+- * @node:		node offset (int)
++ * @property:	property offset (int, lvalue)
++ * @fdt:	FDT blob (const void *)
++ * @node:	node offset (int)
+  *
+  * This is actually a wrapper around a for loop and would be used like so:
+  *
+@@ -607,6 +671,13 @@ int fdt_next_property_offset(const void *fdt, int offset);
+ const struct fdt_property *fdt_get_property_by_offset(const void *fdt,
+ 						      int offset,
+ 						      int *lenp);
++static inline struct fdt_property *fdt_get_property_by_offset_w(void *fdt,
++								int offset,
++								int *lenp)
++{
++	return (struct fdt_property *)(uintptr_t)
++		fdt_get_property_by_offset(fdt, offset, lenp);
++}
+ 
+ /**
+  * fdt_get_property_namelen - find a property based on substring
+@@ -618,12 +689,22 @@ const struct fdt_property *fdt_get_property_by_offset(const void *fdt,
+  *
+  * Identical to fdt_get_property(), but only examine the first namelen
+  * characters of name for matching the property name.
++ *
++ * Return: pointer to the structure representing the property, or NULL
++ *         if not found
+  */
+ #ifndef SWIG /* Not available in Python */
+ const struct fdt_property *fdt_get_property_namelen(const void *fdt,
+ 						    int nodeoffset,
+ 						    const char *name,
+ 						    int namelen, int *lenp);
++static inline struct fdt_property *
++fdt_get_property_namelen_w(void *fdt, int nodeoffset, const char *name,
++			   int namelen, int *lenp)
++{
++	return (struct fdt_property *)(uintptr_t)fdt_get_property_namelen(
++		fdt, nodeoffset, name, namelen, lenp);
++}
+ #endif
+ 
+ /**
+@@ -676,7 +757,7 @@ static inline struct fdt_property *fdt_get_property_w(void *fdt, int nodeoffset,
+  * to within the device blob itself, not a copy of the value).  If
+  * lenp is non-NULL, the length of the property value is also
+  * returned, in the integer pointed to by lenp.  If namep is non-NULL,
+- * the property's namne will also be returned in the char * pointed to
++ * the property's name will also be returned in the char * pointed to
+  * by namep (this will be a pointer to within the device tree's string
+  * block, not a new copy of the name).
+  *
+@@ -684,7 +765,7 @@ static inline struct fdt_property *fdt_get_property_w(void *fdt, int nodeoffset,
+  *	pointer to the property's value
+  *		if lenp is non-NULL, *lenp contains the length of the property
+  *		value (>=0)
+- *		if namep is non-NULL *namep contiains a pointer to the property
++ *		if namep is non-NULL *namep contains a pointer to the property
+  *		name.
+  *	NULL, on error
+  *		if lenp is non-NULL, *lenp contains an error code (<0):
+@@ -710,6 +791,8 @@ const void *fdt_getprop_by_offset(const void *fdt, int offset,
+  *
+  * Identical to fdt_getprop(), but only examine the first namelen
+  * characters of name for matching the property name.
++ *
++ * Return: pointer to the property's value or NULL on error
+  */
+ #ifndef SWIG /* Not available in Python */
+ const void *fdt_getprop_namelen(const void *fdt, int nodeoffset,
+@@ -731,10 +814,10 @@ static inline void *fdt_getprop_namelen_w(void *fdt, int nodeoffset,
+  * @lenp: pointer to an integer variable (will be overwritten) or NULL
+  *
+  * fdt_getprop() retrieves a pointer to the value of the property
+- * named 'name' of the node at offset nodeoffset (this will be a
++ * named @name of the node at offset @nodeoffset (this will be a
+  * pointer to within the device blob itself, not a copy of the value).
+- * If lenp is non-NULL, the length of the property value is also
+- * returned, in the integer pointed to by lenp.
++ * If @lenp is non-NULL, the length of the property value is also
++ * returned, in the integer pointed to by @lenp.
+  *
+  * returns:
+  *	pointer to the property's value
+@@ -776,11 +859,14 @@ uint32_t fdt_get_phandle(const void *fdt, int nodeoffset);
+ /**
+  * fdt_get_alias_namelen - get alias based on substring
+  * @fdt: pointer to the device tree blob
+- * @name: name of the alias th look up
++ * @name: name of the alias to look up
+  * @namelen: number of characters of name to consider
+  *
+- * Identical to fdt_get_alias(), but only examine the first namelen
+- * characters of name for matching the alias name.
++ * Identical to fdt_get_alias(), but only examine the first @namelen
++ * characters of @name for matching the alias name.
++ *
++ * Return: a pointer to the expansion of the alias named @name, if it exists,
++ *	   NULL otherwise
+  */
+ #ifndef SWIG /* Not available in Python */
+ const char *fdt_get_alias_namelen(const void *fdt,
+@@ -790,10 +876,10 @@ const char *fdt_get_alias_namelen(const void *fdt,
+ /**
+  * fdt_get_alias - retrieve the path referenced by a given alias
+  * @fdt: pointer to the device tree blob
+- * @name: name of the alias th look up
++ * @name: name of the alias to look up
+  *
+  * fdt_get_alias() retrieves the value of a given alias.  That is, the
+- * value of the property named 'name' in the node /aliases.
++ * value of the property named @name in the node /aliases.
+  *
+  * returns:
+  *	a pointer to the expansion of the alias named 'name', if it exists
+@@ -801,6 +887,42 @@ const char *fdt_get_alias_namelen(const void *fdt,
+  */
+ const char *fdt_get_alias(const void *fdt, const char *name);
+ 
++/**
++ * fdt_get_symbol_namelen - get symbol based on substring
++ * @fdt: pointer to the device tree blob
++ * @name: name of the symbol to look up
++ * @namelen: number of characters of name to consider
++ *
++ * Identical to fdt_get_symbol(), but only examine the first @namelen
++ * characters of @name for matching the symbol name.
++ *
++ * Return: a pointer to the expansion of the symbol named @name, if it exists,
++ *	   NULL otherwise
++ */
++#ifndef SWIG /* Not available in Python */
++const char *fdt_get_symbol_namelen(const void *fdt,
++				   const char *name, int namelen);
++#endif
++
++/**
++ * fdt_get_symbol - retrieve the path referenced by a given symbol
++ * @fdt: pointer to the device tree blob
++ * @name: name of the symbol to look up
++ *
++ * fdt_get_symbol() retrieves the value of a given symbol.  That is,
++ * the value of the property named @name in the node
++ * /__symbols__. Such a node exists only for a device tree blob that
++ * has been compiled with the -@ dtc option. Each property corresponds
++ * to a label appearing in the device tree source, with the name of
++ * the property being the label and the value being the full path of
++ * the node it is attached to.
++ *
++ * returns:
++ *	a pointer to the expansion of the symbol named 'name', if it exists
++ *	NULL, if the given symbol or the /__symbols__ node does not exist
++ */
++const char *fdt_get_symbol(const void *fdt, const char *name);
++
+ /**
+  * fdt_get_path - determine the full path of a node
+  * @fdt: pointer to the device tree blob
+@@ -969,14 +1091,13 @@ int fdt_node_offset_by_prop_value(const void *fdt, int startoffset,
+ int fdt_node_offset_by_phandle(const void *fdt, uint32_t phandle);
+ 
+ /**
+- * fdt_node_check_compatible: check a node's compatible property
++ * fdt_node_check_compatible - check a node's compatible property
+  * @fdt: pointer to the device tree blob
+  * @nodeoffset: offset of a tree node
+  * @compatible: string to match against
+  *
+- *
+  * fdt_node_check_compatible() returns 0 if the given node contains a
+- * 'compatible' property with the given string as one of its elements,
++ * @compatible property with the given string as one of its elements,
+  * it returns non-zero otherwise, or on error.
+  *
+  * returns:
+@@ -1040,7 +1161,7 @@ int fdt_node_offset_by_compatible(const void *fdt, int startoffset,
+  * one or more strings, each terminated by \0, as is found in a device tree
+  * "compatible" property.
+  *
+- * @return: 1 if the string is found in the list, 0 not found, or invalid list
++ * Return: 1 if the string is found in the list, 0 not found, or invalid list
+  */
+ int fdt_stringlist_contains(const char *strlist, int listlen, const char *str);
+ 
+@@ -1049,7 +1170,8 @@ int fdt_stringlist_contains(const char *strlist, int listlen, const char *str);
+  * @fdt: pointer to the device tree blob
+  * @nodeoffset: offset of a tree node
+  * @property: name of the property containing the string list
+- * @return:
++ *
++ * Return:
+  *   the number of strings in the given property
+  *   -FDT_ERR_BADVALUE if the property value is not NUL-terminated
+  *   -FDT_ERR_NOTFOUND if the property does not exist
+@@ -1069,7 +1191,7 @@ int fdt_stringlist_count(const void *fdt, int nodeoffset, const char *property);
+  * small-valued cell properties, such as #address-cells, when searching for
+  * the empty string.
+  *
+- * @return:
++ * return:
+  *   the index of the string in the list of strings
+  *   -FDT_ERR_BADVALUE if the property value is not NUL-terminated
+  *   -FDT_ERR_NOTFOUND if the property does not exist or does not contain
+@@ -1093,7 +1215,7 @@ int fdt_stringlist_search(const void *fdt, int nodeoffset, const char *property,
+  * If non-NULL, the length of the string (on success) or a negative error-code
+  * (on failure) will be stored in the integer pointer to by lenp.
+  *
+- * @return:
++ * Return:
+  *   A pointer to the string at the given index in the string list or NULL on
+  *   failure. On success the length of the string will be stored in the memory
+  *   location pointed to by the lenp parameter, if non-NULL. On failure one of
+@@ -1130,8 +1252,8 @@ const char *fdt_stringlist_get(const void *fdt, int nodeoffset,
+  *
+  * returns:
+  *	0 <= n < FDT_MAX_NCELLS, on success
+- *      2, if the node has no #address-cells property
+- *      -FDT_ERR_BADNCELLS, if the node has a badly formatted or invalid
++ *	2, if the node has no #address-cells property
++ *	-FDT_ERR_BADNCELLS, if the node has a badly formatted or invalid
+  *		#address-cells property
+  *	-FDT_ERR_BADMAGIC,
+  *	-FDT_ERR_BADVERSION,
+@@ -1151,8 +1273,8 @@ int fdt_address_cells(const void *fdt, int nodeoffset);
+  *
+  * returns:
+  *	0 <= n < FDT_MAX_NCELLS, on success
+- *      1, if the node has no #size-cells property
+- *      -FDT_ERR_BADNCELLS, if the node has a badly formatted or invalid
++ *	1, if the node has no #size-cells property
++ *	-FDT_ERR_BADNCELLS, if the node has a badly formatted or invalid
+  *		#size-cells property
+  *	-FDT_ERR_BADMAGIC,
+  *	-FDT_ERR_BADVERSION,
+@@ -1181,6 +1303,8 @@ int fdt_size_cells(const void *fdt, int nodeoffset);
+  * starting from the given index, and using only the first characters
+  * of the name. It is useful when you want to manipulate only one value of
+  * an array and you have a string that doesn't end with \0.
++ *
++ * Return: 0 on success, negative libfdt error value otherwise
+  */
+ #ifndef SWIG /* Not available in Python */
+ int fdt_setprop_inplace_namelen_partial(void *fdt, int nodeoffset,
+@@ -1294,8 +1418,13 @@ static inline int fdt_setprop_inplace_u64(void *fdt, int nodeoffset,
+ 
+ /**
+  * fdt_setprop_inplace_cell - change the value of a single-cell property
++ * @fdt: pointer to the device tree blob
++ * @nodeoffset: offset of the node containing the property
++ * @name: name of the property to change the value of
++ * @val: new value of the 32-bit cell
+  *
+  * This is an alternative name for fdt_setprop_inplace_u32()
++ * Return: 0 on success, negative libfdt error number otherwise.
+  */
+ static inline int fdt_setprop_inplace_cell(void *fdt, int nodeoffset,
+ 					   const char *name, uint32_t val)
+@@ -1367,14 +1496,14 @@ int fdt_nop_node(void *fdt, int nodeoffset);
+ 
+ /**
+  * fdt_create_with_flags - begin creation of a new fdt
+- * @fdt: pointer to memory allocated where fdt will be created
++ * @buf: pointer to memory allocated where fdt will be created
+  * @bufsize: size of the memory space at fdt
+  * @flags: a valid combination of FDT_CREATE_FLAG_ flags, or 0.
+  *
+  * fdt_create_with_flags() begins the process of creating a new fdt with
+  * the sequential write interface.
+  *
+- * fdt creation process must end with fdt_finished() to produce a valid fdt.
++ * fdt creation process must end with fdt_finish() to produce a valid fdt.
+  *
+  * returns:
+  *	0, on success
+@@ -1385,7 +1514,7 @@ int fdt_create_with_flags(void *buf, int bufsize, uint32_t flags);
+ 
+ /**
+  * fdt_create - begin creation of a new fdt
+- * @fdt: pointer to memory allocated where fdt will be created
++ * @buf: pointer to memory allocated where fdt will be created
+  * @bufsize: size of the memory space at fdt
+  *
+  * fdt_create() is equivalent to fdt_create_with_flags() with flags=0.
+@@ -1425,7 +1554,7 @@ static inline int fdt_property_cell(void *fdt, const char *name, uint32_t val)
+  * @fdt: pointer to the device tree blob
+  * @name: name of property to add
+  * @len: length of property value in bytes
+- * @valp: returns a pointer to where where the value should be placed
++ * @valp: returns a pointer to where the value should be placed
+  *
+  * returns:
+  *	0, on success
+@@ -1450,7 +1579,8 @@ int fdt_pack(void *fdt);
+ /**
+  * fdt_add_mem_rsv - add one memory reserve map entry
+  * @fdt: pointer to the device tree blob
+- * @address, @size: 64-bit values (native endian)
++ * @address: 64-bit start address of the reserve map entry
++ * @size: 64-bit size of the reserved region
+  *
+  * Adds a reserve map entry to the given blob reserving a region at
+  * address address of length size.
+@@ -1521,6 +1651,38 @@ int fdt_del_mem_rsv(void *fdt, int n);
+  */
+ int fdt_set_name(void *fdt, int nodeoffset, const char *name);
+ 
++/**
++ * fdt_setprop_namelen - create or change a property
++ * @fdt: pointer to the device tree blob
++ * @nodeoffset: offset of the node whose property to change
++ * @name: name of the property to change
++ * @namelen: length of the name
++ * @val: pointer to data to set the property value to
++ * @len: length of the property value
++ *
++ * fdt_setprop_namelen() sets the value of the named property in the given
++ * node to the given value and length, creating the property if it
++ * does not already exist.
++ *
++ * This function may insert or delete data from the blob, and will
++ * therefore change the offsets of some existing nodes.
++ *
++ * returns:
++ *	0, on success
++ *	-FDT_ERR_NOSPACE, there is insufficient free space in the blob to
++ *		contain the new property value
++ *	-FDT_ERR_BADOFFSET, nodeoffset did not point to FDT_BEGIN_NODE tag
++ *	-FDT_ERR_BADLAYOUT,
++ *	-FDT_ERR_BADMAGIC,
++ *	-FDT_ERR_BADVERSION,
++ *	-FDT_ERR_BADSTATE,
++ *	-FDT_ERR_BADSTRUCTURE,
++ *	-FDT_ERR_BADLAYOUT,
++ *	-FDT_ERR_TRUNCATED, standard meanings
++ */
++int fdt_setprop_namelen(void *fdt, int nodeoffset, const char *name,
++			int namelen, const void *val, int len);
++
+ /**
+  * fdt_setprop - create or change a property
+  * @fdt: pointer to the device tree blob
+@@ -1549,8 +1711,44 @@ int fdt_set_name(void *fdt, int nodeoffset, const char *name);
+  *	-FDT_ERR_BADLAYOUT,
+  *	-FDT_ERR_TRUNCATED, standard meanings
+  */
+-int fdt_setprop(void *fdt, int nodeoffset, const char *name,
+-		const void *val, int len);
++static inline int fdt_setprop(void *fdt, int nodeoffset, const char *name,
++			      const void *val, int len)
++{
++	return fdt_setprop_namelen(fdt, nodeoffset, name, strlen(name), val,
++				   len);
++}
++
++/**
++ * fdt_setprop_placeholder_namelen - allocate space for a property
++ * @fdt: pointer to the device tree blob
++ * @nodeoffset: offset of the node whose property to change
++ * @name: name of the property to change
++ * @namelen: length of the name
++ * @len: length of the property value
++ * @prop_data: return pointer to property data
++ *
++ * fdt_setprop_placeholder_namelen() allocates the named property in the given node.
++ * If the property exists it is resized. In either case a pointer to the
++ * property data is returned.
++ *
++ * This function may insert or delete data from the blob, and will
++ * therefore change the offsets of some existing nodes.
++ *
++ * returns:
++ *	0, on success
++ *	-FDT_ERR_NOSPACE, there is insufficient free space in the blob to
++ *		contain the new property value
++ *	-FDT_ERR_BADOFFSET, nodeoffset did not point to FDT_BEGIN_NODE tag
++ *	-FDT_ERR_BADLAYOUT,
++ *	-FDT_ERR_BADMAGIC,
++ *	-FDT_ERR_BADVERSION,
++ *	-FDT_ERR_BADSTATE,
++ *	-FDT_ERR_BADSTRUCTURE,
++ *	-FDT_ERR_BADLAYOUT,
++ *	-FDT_ERR_TRUNCATED, standard meanings
++ */
++int fdt_setprop_placeholder_namelen(void *fdt, int nodeoffset, const char *name,
++				    int namelen, int len, void **prop_data);
+ 
+ /**
+  * fdt_setprop_placeholder - allocate space for a property
+@@ -1560,7 +1758,7 @@ int fdt_setprop(void *fdt, int nodeoffset, const char *name,
+  * @len: length of the property value
+  * @prop_data: return pointer to property data
+  *
+- * fdt_setprop_placeholer() allocates the named property in the given node.
++ * fdt_setprop_placeholder() allocates the named property in the given node.
+  * If the property exists it is resized. In either case a pointer to the
+  * property data is returned.
+  *
+@@ -1580,8 +1778,13 @@ int fdt_setprop(void *fdt, int nodeoffset, const char *name,
+  *	-FDT_ERR_BADLAYOUT,
+  *	-FDT_ERR_TRUNCATED, standard meanings
+  */
+-int fdt_setprop_placeholder(void *fdt, int nodeoffset, const char *name,
+-			    int len, void **prop_data);
++static inline int fdt_setprop_placeholder(void *fdt, int nodeoffset,
++					  const char *name, int len,
++					  void **prop_data)
++{
++	return fdt_setprop_placeholder_namelen(fdt, nodeoffset, name,
++					       strlen(name), len, prop_data);
++}
+ 
+ /**
+  * fdt_setprop_u32 - set a property to a 32-bit integer
+@@ -1655,8 +1858,14 @@ static inline int fdt_setprop_u64(void *fdt, int nodeoffset, const char *name,
+ 
+ /**
+  * fdt_setprop_cell - set a property to a single cell value
++ * @fdt: pointer to the device tree blob
++ * @nodeoffset: offset of the node whose property to change
++ * @name: name of the property to change
++ * @val: 32-bit integer value for the property (native endian)
+  *
+  * This is an alternative name for fdt_setprop_u32()
++ *
++ * Return: 0 on success, negative libfdt error value otherwise.
+  */
+ static inline int fdt_setprop_cell(void *fdt, int nodeoffset, const char *name,
+ 				   uint32_t val)
+@@ -1695,6 +1904,39 @@ static inline int fdt_setprop_cell(void *fdt, int nodeoffset, const char *name,
+ #define fdt_setprop_string(fdt, nodeoffset, name, str) \
+ 	fdt_setprop((fdt), (nodeoffset), (name), (str), strlen(str)+1)
+ 
++/**
++ * fdt_setprop_namelen_string - set a property to a string value
++ * @fdt: pointer to the device tree blob
++ * @nodeoffset: offset of the node whose property to change
++ * @name: name of the property to change
++ * @namelen: number of characters of name to consider
++ * @str: string value for the property
++ *
++ * fdt_setprop_namelen_string() sets the value of the named property in the
++ * given node to the given string value (using the length of the
++ * string to determine the new length of the property), or creates a
++ * new property with that value if it does not already exist.
++ *
++ * This function may insert or delete data from the blob, and will
++ * therefore change the offsets of some existing nodes.
++ *
++ * returns:
++ *	0, on success
++ *	-FDT_ERR_NOSPACE, there is insufficient free space in the blob to
++ *		contain the new property value
++ *	-FDT_ERR_BADOFFSET, nodeoffset did not point to FDT_BEGIN_NODE tag
++ *	-FDT_ERR_BADLAYOUT,
++ *	-FDT_ERR_BADMAGIC,
++ *	-FDT_ERR_BADVERSION,
++ *	-FDT_ERR_BADSTATE,
++ *	-FDT_ERR_BADSTRUCTURE,
++ *	-FDT_ERR_BADLAYOUT,
++ *	-FDT_ERR_TRUNCATED, standard meanings
++ */
++#define fdt_setprop_namelen_string(fdt, nodeoffset, name, namelen, str)    \
++	fdt_setprop_namelen((fdt), (nodeoffset), (name), (namelen), (str), \
++			    strlen(str) + 1)
++
+ /**
+  * fdt_setprop_empty - set a property to an empty value
+  * @fdt: pointer to the device tree blob
+@@ -1826,8 +2068,14 @@ static inline int fdt_appendprop_u64(void *fdt, int nodeoffset,
+ 
+ /**
+  * fdt_appendprop_cell - append a single cell value to a property
++ * @fdt: pointer to the device tree blob
++ * @nodeoffset: offset of the node whose property to change
++ * @name: name of the property to change
++ * @val: 32-bit integer value to append to the property (native endian)
+  *
+  * This is an alternative name for fdt_appendprop_u32()
++ *
++ * Return: 0 on success, negative libfdt error value otherwise.
+  */
+ static inline int fdt_appendprop_cell(void *fdt, int nodeoffset,
+ 				      const char *name, uint32_t val)
+@@ -1878,7 +2126,7 @@ static inline int fdt_appendprop_cell(void *fdt, int nodeoffset,
+  * address and size) to the value of the named property in the given
+  * node, or creates a new property with that value if it does not
+  * already exist.
+- * If "name" is not specified, a default "reg" is used.
++ *
+  * Cell sizes are determined by parent's #address-cells and #size-cells.
+  *
+  * This function may insert data into the blob, and will therefore
+@@ -1908,7 +2156,7 @@ int fdt_appendprop_addrrange(void *fdt, int parent, int nodeoffset,
+  * @nodeoffset: offset of the node whose property to nop
+  * @name: name of the property to nop
+  *
+- * fdt_del_property() will delete the given property.
++ * fdt_delprop() will delete the given property.
+  *
+  * This function will delete data from the blob, and will therefore
+  * change the offsets of some existing nodes.
+@@ -1930,13 +2178,16 @@ int fdt_delprop(void *fdt, int nodeoffset, const char *name);
+  * fdt_add_subnode_namelen - creates a new node based on substring
+  * @fdt: pointer to the device tree blob
+  * @parentoffset: structure block offset of a node
+- * @name: name of the subnode to locate
++ * @name: name of the subnode to create
+  * @namelen: number of characters of name to consider
+  *
+- * Identical to fdt_add_subnode(), but use only the first namelen
+- * characters of name as the name of the new node.  This is useful for
++ * Identical to fdt_add_subnode(), but use only the first @namelen
++ * characters of @name as the name of the new node.  This is useful for
+  * creating subnodes based on a portion of a larger string, such as a
+  * full path.
++ *
++ * Return: structure block offset of the created subnode (>=0),
++ *	   negative libfdt error value otherwise
+  */
+ #ifndef SWIG /* Not available in Python */
+ int fdt_add_subnode_namelen(void *fdt, int parentoffset,
+@@ -1955,10 +2206,9 @@ int fdt_add_subnode_namelen(void *fdt, int parentoffset,
+  *
+  * This function will insert data into the blob, and will therefore
+  * change the offsets of some existing nodes.
+-
++ *
+  * returns:
+- *	structure block offset of the created nodeequested subnode (>=0), on
+- *		success
++ *	structure block offset of the created subnode (>=0), on success
+  *	-FDT_ERR_NOTFOUND, if the requested subnode does not exist
+  *	-FDT_ERR_BADOFFSET, if parentoffset did not point to an FDT_BEGIN_NODE
+  *		tag
+@@ -1968,7 +2218,7 @@ int fdt_add_subnode_namelen(void *fdt, int parentoffset,
+  *		blob to contain the new node
+  *	-FDT_ERR_NOSPACE
+  *	-FDT_ERR_BADLAYOUT
+- *      -FDT_ERR_BADMAGIC,
++ *	-FDT_ERR_BADMAGIC,
+  *	-FDT_ERR_BADVERSION,
+  *	-FDT_ERR_BADSTATE,
+  *	-FDT_ERR_BADSTRUCTURE,
+@@ -2013,7 +2263,7 @@ int fdt_del_node(void *fdt, int nodeoffset);
+  * returns:
+  *	0, on success
+  *	-FDT_ERR_NOSPACE, there's not enough space in the base device tree
+- *	-FDT_ERR_NOTFOUND, the overlay points to some inexistant nodes or
++ *	-FDT_ERR_NOTFOUND, the overlay points to some nonexistent nodes or
+  *		properties in the base DT
+  *	-FDT_ERR_BADPHANDLE,
+  *	-FDT_ERR_BADOVERLAY,
+@@ -2030,6 +2280,24 @@ int fdt_del_node(void *fdt, int nodeoffset);
+  */
+ int fdt_overlay_apply(void *fdt, void *fdto);
+ 
++/**
++ * fdt_overlay_target_offset - retrieves the offset of a fragment's target
++ * @fdt: Base device tree blob
++ * @fdto: Device tree overlay blob
++ * @fragment_offset: node offset of the fragment in the overlay
++ * @pathp: pointer which receives the path of the target (or NULL)
++ *
++ * fdt_overlay_target_offset() retrieves the target offset in the base
++ * device tree of a fragment, no matter how the actual targeting is
++ * done (through a phandle or a path)
++ *
++ * returns:
++ *      the targeted node offset in the base device tree
++ *      Negative error code on error
++ */
++int fdt_overlay_target_offset(const void *fdt, const void *fdto,
++			      int fragment_offset, char const **pathp);
++
+ /**
+  * fdt_overlay_apply_node - Merges a node into the base device tree
+  *
+@@ -2043,4 +2311,8 @@ int fdt_overlay_apply_node(void *fdt, int target, void *fdto, int node);
+ 
+ const char *fdt_strerror(int errval);
+ 
++#ifdef __cplusplus
++}
++#endif
++
+ #endif /* LIBFDT_H */
+diff --git a/scripts/dtc/libfdt/libfdt_internal.h b/scripts/dtc/libfdt/libfdt_internal.h
+index 5436e2ceeac..b60b5456f59 100644
+--- a/scripts/dtc/libfdt/libfdt_internal.h
++++ b/scripts/dtc/libfdt/libfdt_internal.h
+@@ -10,20 +10,25 @@
+ #define FDT_ALIGN(x, a)		(((x) + (a) - 1) & ~((a) - 1))
+ #define FDT_TAGALIGN(x)		(FDT_ALIGN((x), FDT_TAGSIZE))
+ 
+-int fdt_ro_probe_(const void *fdt);
++int32_t fdt_ro_probe_(const void *fdt);
+ #define FDT_RO_PROBE(fdt)					\
+ 	{							\
+-		int totalsize_;					\
+-		if (fdt_chk_basic()) {				\
+-			totalsize_ = fdt_ro_probe_(fdt);	\
+-			if (totalsize_ < 0)			\
+-				return totalsize_;		\
+-		}						\
++		int32_t totalsize_;				\
++		if ((totalsize_ = fdt_ro_probe_(fdt)) < 0)	\
++			return totalsize_;			\
+ 	}
+ 
+ int fdt_check_node_offset_(const void *fdt, int offset);
+ int fdt_check_prop_offset_(const void *fdt, int offset);
+-const char *fdt_find_string_(const char *strtab, int tabsize, const char *s);
++
++const char *fdt_find_string_len_(const char *strtab, int tabsize, const char *s,
++				 int s_len);
++static inline const char *fdt_find_string_(const char *strtab, int tabsize,
++					   const char *s)
++{
++	return fdt_find_string_len_(strtab, tabsize, s, strlen(s));
++}
++
+ int fdt_node_end_offset_(void *fdt, int nodeoffset);
+ 
+ static inline const void *fdt_offset_ptr_(const void *fdt, int offset)
+@@ -49,6 +54,25 @@ static inline struct fdt_reserve_entry *fdt_mem_rsv_w_(void *fdt, int n)
+ 	return (void *)(uintptr_t)fdt_mem_rsv_(fdt, n);
+ }
+ 
++/*
++ * Internal helpers to access structural elements of the device tree
++ * blob (rather than for example reading integers from within property
++ * values).  We assume that we are either given a naturally aligned
++ * address for the platform or if we are not, we are on a platform
++ * where unaligned memory reads will be handled in a graceful manner.
++ * If not the external helpers fdtXX_ld() from libfdt.h can be used
++ * instead.
++ */
++static inline uint32_t fdt32_ld_(const fdt32_t *p)
++{
++	return fdt32_to_cpu(*p);
++}
++
++static inline uint64_t fdt64_ld_(const fdt64_t *p)
++{
++	return fdt64_to_cpu(*p);
++}
++
+ #define FDT_SW_MAGIC		(~FDT_MAGIC)
+ 
+ /**********************************************************************/
+@@ -61,20 +85,21 @@ static inline struct fdt_reserve_entry *fdt_mem_rsv_w_(void *fdt, int n)
+ 
+ /*
+  * Defines assumptions which can be enabled. Each of these can be enabled
+- * individually. For maximum saftey, don't enable any assumptions!
++ * individually. For maximum safety, don't enable any assumptions!
+  *
+- * For minimal code size and no safety, use FDT_ASSUME_PERFECT at your own risk.
++ * For minimal code size and no safety, use ASSUME_PERFECT at your own risk.
+  * You should have another method of validating the device tree, such as a
+  * signature or hash check before using libfdt.
+  *
+  * For situations where security is not a concern it may be safe to enable
+- * FDT_ASSUME_FRIENDLY.
++ * ASSUME_SANE.
+  */
+ enum {
+ 	/*
+ 	 * This does essentially no checks. Only the latest device-tree
+-	 * version is correctly handled. Incosistencies or errors in the device
+-	 * tree may cause undefined behaviour or crashes.
++	 * version is correctly handled. Inconsistencies or errors in the device
++	 * tree may cause undefined behaviour or crashes. Invalid parameters
++	 * passed to libfdt may do the same.
+ 	 *
+ 	 * If an error occurs when modifying the tree it may leave the tree in
+ 	 * an intermediate (but valid) state. As an example, adding a property
+@@ -85,17 +110,35 @@ enum {
+ 	 * Only use this if you have a fully validated device tree with
+ 	 * the latest supported version and wish to minimise code size.
+ 	 */
+-	FDT_ASSUME_PERFECT	= 0xff,
++	ASSUME_PERFECT		= 0xff,
+ 
+ 	/*
+ 	 * This assumes that the device tree is sane. i.e. header metadata
+ 	 * and basic hierarchy are correct.
+ 	 *
+-	 * These checks will be sufficient if you have a valid device tree with
+-	 * no internal inconsistencies. With this assumption, libfdt will
+-	 * generally not return -FDT_ERR_INTERNAL, -FDT_ERR_BADLAYOUT, etc.
++	 * With this assumption enabled, normal device trees produced by libfdt
++	 * and the compiler should be handled safely. Malicious device trees and
++	 * complete garbage may cause libfdt to behave badly or crash. Truncated
++	 * device trees (e.g. those only partially loaded) can also cause
++	 * problems.
++	 *
++	 * Note: Only checks that relate exclusively to the device tree itself
++	 * (not the parameters passed to libfdt) are disabled by this
++	 * assumption. This includes checking headers, tags and the like.
++	 */
++	ASSUME_VALID_DTB	= 1 << 0,
++
++	/*
++	 * This builds on ASSUME_VALID_DTB and further assumes that libfdt
++	 * functions are called with valid parameters, i.e. not trigger
++	 * FDT_ERR_BADOFFSET or offsets that are out of bounds. It disables any
++	 * extensive checking of parameters and the device tree, making various
++	 * assumptions about correctness.
++	 *
++	 * It doesn't make sense to enable this assumption unless
++	 * ASSUME_VALID_DTB is also enabled.
+ 	 */
+-	FDT_ASSUME_SANE		= 1 << 0,
++	ASSUME_VALID_INPUT	= 1 << 1,
+ 
+ 	/*
+ 	 * This disables checks for device-tree version and removes all code
+@@ -104,34 +147,54 @@ enum {
+ 	 * Only enable this if you know you have a device tree with the latest
+ 	 * version.
+ 	 */
+-	FDT_ASSUME_LATEST	= 1 << 1,
++	ASSUME_LATEST		= 1 << 2,
+ 
+ 	/*
+-	 * This disables any extensive checking of parameters and the device
+-	 * tree, making various assumptions about correctness. Normal device
+-	 * trees produced by libfdt and the compiler should be handled safely.
+-	 * Malicious device trees and complete garbage may cause libfdt to
+-	 * behave badly or crash.
++	 * This assumes that it is OK for a failed addition to the device tree,
++	 * due to lack of space or some other problem, to skip any rollback
++	 * steps (such as dropping the property name from the string table).
++	 * This is safe to enable in most circumstances, even though it may
++	 * leave the tree in a sub-optimal state.
+ 	 */
+-	FDT_ASSUME_FRIENDLY	= 1 << 2,
+-};
++	ASSUME_NO_ROLLBACK	= 1 << 3,
+ 
+-/** fdt_chk_basic() - see if basic checking of params and DT data is enabled */
+-static inline bool fdt_chk_basic(void)
+-{
+-	return !(FDT_ASSUME_MASK & FDT_ASSUME_SANE);
+-}
++	/*
++	 * This assumes that the device tree components appear in a 'convenient'
++	 * order, i.e. the memory reservation block first, then the structure
++	 * block and finally the string block.
++	 *
++	 * This order is not specified by the device-tree specification,
++	 * but is expected by libfdt. The device-tree compiler always created
++	 * device trees with this order.
++	 *
++	 * This assumption disables a check in fdt_open_into() and removes the
++	 * ability to fix the problem there. This is safe if you know that the
++	 * device tree is correctly ordered. See fdt_blocks_misordered_().
++	 */
++	ASSUME_LIBFDT_ORDER	= 1 << 4,
+ 
+-/** fdt_chk_version() - see if we need to handle old versions of the DT */
+-static inline bool fdt_chk_version(void)
+-{
+-	return !(FDT_ASSUME_MASK & FDT_ASSUME_LATEST);
+-}
++	/*
++	 * This assumes that libfdt itself does not have any internal bugs. It
++	 * drops certain checks that should never be needed unless libfdt has an
++	 * undiscovered bug.
++	 *
++	 * This can generally be considered safe to enable.
++	 */
++	ASSUME_LIBFDT_FLAWLESS	= 1 << 5,
++};
+ 
+-/** fdt_chk_extra() - see if extra checking is enabled */
+-static inline bool fdt_chk_extra(void)
++/**
++ * can_assume_() - check if a particular assumption is enabled
++ *
++ * @mask: Mask to check (ASSUME_...)
++ * @return true if that assumption is enabled, else false
++ */
++static inline bool can_assume_(int mask)
+ {
+-	return !(FDT_ASSUME_MASK & FDT_ASSUME_FRIENDLY);
++	return FDT_ASSUME_MASK & mask;
+ }
+ 
++/** helper macros for checking assumptions */
++#define can_assume(_assume)	can_assume_(ASSUME_ ## _assume)
++
+ #endif /* LIBFDT_INTERNAL_H */
+diff --git a/tools/libfdt/fdt_rw.c b/tools/libfdt/fdt_rw.c
+index 3d3395b125b..d6c8ec323d4 100644
+--- a/tools/libfdt/fdt_rw.c
++++ b/tools/libfdt/fdt_rw.c
+@@ -26,7 +26,7 @@ int fdt_remove_unused_strings(const void *old, void *new)
+ 		new_prop = (struct fdt_property *)(unsigned long)
+ 			fdt_get_property_by_offset(new, offset, NULL);
+ 		str = fdt_string(old, fdt32_to_cpu(old_prop->nameoff));
+-		ret = fdt_find_add_string_(new, str, &allocated);
++		ret = fdt_find_add_string_(new, str, strlen(str), &allocated);
+ 		if (ret < 0)
+ 			return ret;
+ 		new_prop->nameoff = cpu_to_fdt32(ret);
