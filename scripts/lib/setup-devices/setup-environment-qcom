@@ -25,9 +25,7 @@ tdx_write_checksum "${_TDX_SCRIPTS}/lib/setup-devices/setup-environment-qcom"
 
 tdx_conf_from_template local.conf
 
-# meta-qcom requires meta-lts-mixins (lts-linux-firmware-mixin) for the
-# Qualcomm firmware packages. Board-specific BSP layers (e.g.
-# meta-qcom-arduino) depend on meta-qcom.
+# Board-specific BSP layers (e.g. meta-qcom-arduino) depend on meta-qcom.
 tdx_append_once conf/bblayers.conf "# Torizon" <<EOF2
 # Torizon
 # LAYER_CONF_VERSION is increased each time build/conf/bblayers.conf
@@ -56,7 +54,6 @@ BASELAYERS ?= " \\
 BSPLAYERS ?= " \\
   \${OEROOT}/layers/meta-yocto/meta-yocto-bsp \\
   \${OEROOT}/layers/meta-yocto/meta-poky \\
-  \${OEROOT}/layers/meta-lts-mixins \\
   \${OEROOT}/layers/meta-qcom \\
   \${OEROOT}/layers/meta-qcom-arduino \\
 "
