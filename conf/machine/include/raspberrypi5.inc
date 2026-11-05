@@ -35,3 +35,9 @@ UENV_EXTRA_CONFIGS:raspberrypi5 = 'env set loadaddr ${kernel_addr_r}; setexpr fd
 # Applied by U-Boot from overlays.txt; config.txt overlays only change the
 # firmware device tree.
 OSTREE_DEVICETREE_OVERLAY_BOOT:raspberrypi5 = "vc4-kms-v3d-pi5.dtbo"
+
+# The Wi-Fi/Bluetooth firmware needs the synaptics-killswitch license
+# (meta-raspberrypi docs/ipcompliance.md): build without it if not accepted.
+RPI_WIFI_FIRMWARE = "linux-firmware-rpidistro-bcm43455 bluez-firmware-rpidistro-bcm4345c0-hcd \
+    linux-firmware-rpidistro-bcm43456 bluez-firmware-rpidistro-bcm4345c5-hcd"
+MACHINE_EXTRA_RRECOMMENDS:remove:raspberrypi5 = "${@bb.utils.contains('LICENSE_FLAGS_ACCEPTED', 'synaptics-killswitch', '', d.getVar('RPI_WIFI_FIRMWARE'), d)}"

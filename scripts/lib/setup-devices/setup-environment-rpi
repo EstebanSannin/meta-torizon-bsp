@@ -25,6 +25,16 @@ tdx_write_checksum "${_TDX_SCRIPTS}/lib/setup-devices/setup-environment-rpi"
 
 tdx_conf_from_template local.conf
 
+# The Wi-Fi/Bluetooth firmware is under the synaptics-killswitch license:
+# without it, the image is built without Wi-Fi and Bluetooth.
+if tdx_needs_once conf/local.conf "synaptics-killswitch"; then
+    if [ "$EULA" == "1" ] || tdx_license_flag_accept \
+        "Do you accept the synaptics-killswitch license of the Wi-Fi/Bluetooth firmware? (y/N)" \
+        "${_TDX_LAYERS_DIR}/meta-raspberrypi/docs/ipcompliance.md"; then
+        tdx_append_license_flags conf/local.conf "synaptics-killswitch"
+    fi
+fi
+
 tdx_append_once conf/bblayers.conf "# Torizon" <<EOF
 # Torizon
 # LAYER_CONF_VERSION is increased each time build/conf/bblayers.conf
